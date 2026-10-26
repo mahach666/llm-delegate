@@ -46,29 +46,150 @@ class Parsing(unittest.TestCase):
         self.assertFalse(d.QUOTA_RE.search("syntax error in file"))
 
 
-class FindExe(unittest.TestCase):
-    def test_batch_file_is_refused(self):
-        real, d.shutil.which = d.shutil.which, lambda n: r"C:\tools\agy.cmd"
+CACHE = {"models": [
+    {"slug": "big", "visibility": "list", "default_reasoning_level": "low",
+     "supported_reasoning_levels": [{"effort": "low"}, {"effort": "high"}, {"effort": "ultra"}]},
+    {"slug": "small", "visibility": "list", "default_reasoning_level": "medium",
+     "supported_reasoning_levels": [{"effort": "low"}, {"effort": "medium"}]},
+    {"slug": "secret", "visibility": "hide", "supported_reasoning_levels": [{"effort": "low"}]},
+]}
+
+
+class Options(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        home = Path(self.tmp.name)
+        (home / "models_cache.json").write_text(json.dumps(CACHE), encoding="utf-8")
+        self.old = os.environ.get("CODEX_HOME")
+        os.environ["CODEX_HOME"] = self.tmp.name
+
+    def tearDown(self):
+        if self.old is None:
+            del os.environ["CODEX_HOME"]
+        else:
+            os.environ["CODEX_HOME"] = self.old
+        self.tmp.cleanup()
+
+    def test_codex_cache(self):
+        self.assertEqual([m["model"] for m in d.codex_models()], ["big", "small"])
+        self.assertEqual(len(d.codex_models(include_hidden=True)), 3)
+
+    def test_unreadable_cache_means_no_validation(self):
+        os.environ["CODEX_HOME"] = self.tmp.name + "-missing"
+        self.assertEqual(d.codex_models(), [])
+        self.assertIsNone(d.check_options("codex", {"model": "anything", "effort": "whatever"}))
+
+    def test_codex_validation(self):
+        self.assertIsNone(d.check_options("codex", {"model": "small", "effort": "medium"}))
+        self.assertIn("no model", d.check_options("codex", {"model": "nope"}))
+        self.assertIn("does not support", d.check_options("codex", {"model": "small", "effort": "ultra"}))
+        self.assertIsNone(d.check_options("codex", {"effort": "ultra"}))  # no model given: Codex's own default, efforts unknown
+        self.assertIsNone(d.check_options("codex", {"model": "secret"}))  # hidden models stay usable
+
+    def test_agy_effort_validation(self):
+        self.assertIsNone(d.check_options("agy", {"effort": "max"}))
+        self.assertIn("not one of", d.check_options("agy", {"effort": "ultra"}))
+
+    def test_per_provider_forms(self):
+        self.assertEqual(d.per_provider(["m1"], ["agy"], "--model"), {"agy": "m1"})
+        self.assertEqual(d.per_provider(["codex=a", "agy=b=c"], ["agy", "codex"], "--model"),
+                         {"codex": "a", "agy": "b=c"})
+
+    def test_per_provider_errors(self):
+        for vals, names in ((["m"], ["agy", "codex"]), (["codex=m"], ["agy"]), (["a", "b"], ["agy"])):
+            with self.assertRaises(ValueError):
+                d.per_provider(vals, names, "--model")
+
+    def test_build_options_shape(self):
+        o = d.build_options(["agy", "codex"], ["codex=small"], ["agy=low", "codex=low"])
+        self.assertEqual(o, {"agy": {"effort": "low"}, "codex": {"model": "small", "effort": "low"}})
+
+    def test_build_options_rejects_bad_pair(self):
+        with self.assertRaises(ValueError):
+            d.build_options(["codex"], ["small"], ["ultra"])
+
+    def run_with_fake_process(self, runner, opts):
+        seen = {}
+
+        class P:
+            returncode, stderr, stdout = 0, "", CODEX_OK if runner is d.run_codex else AGY_OK
+        real_run, real_find = d._run, d.find_exe
+        d._run = lambda cmd, *a, **k: (seen.setdefault("cmd", cmd), P)[1]
+        d.find_exe = lambda n: n
         try:
-            self.assertFalse(d.run_agy("q", ".", False, None, 5).ok)
-            self.assertIn("batch file", d.run_agy("q", ".", False, None, 5).err)
+            self.assertTrue(runner("q", ".", False, opts, 5).ok)
         finally:
-            d.shutil.which = real
+            d._run, d.find_exe = real_run, real_find
+        return seen["cmd"]
+
+    def test_codex_command_line(self):
+        cmd = self.run_with_fake_process(d.run_codex, {"model": "small", "effort": "low"})
+        self.assertEqual(cmd[cmd.index("-m") + 1], "small")
+        self.assertEqual(cmd[cmd.index("-c") + 1], 'model_reasoning_effort="low"')
+        self.assertEqual(cmd[-1], "-")  # the prompt marker stays last
+        self.assertIn("--ignore-user-config", cmd)
+        self.assertIn("--ignore-rules", cmd)
+        self.assertEqual(cmd[cmd.index("-s") + 1], "read-only")
+
+    def test_agy_command_line(self):
+        cmd = self.run_with_fake_process(d.run_agy, {"model": "m", "effort": "max"})
+        self.assertEqual(cmd[cmd.index("--model") + 1], "m")
+        self.assertEqual(cmd[cmd.index("--effort") + 1], "max")
+        self.assertEqual(cmd[cmd.index("--mode") + 1], "plan")
+
+    def test_no_options_adds_no_model_flags(self):
+        cmd = self.run_with_fake_process(d.run_codex, {})
+        self.assertNotIn("-m", cmd)
+        self.assertNotIn("-c", cmd)
+
+
+class FindExe(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name).resolve()
+        self.old_path, self.old_cwd = os.environ.get("PATH"), os.getcwd()
+        self.exe = "agy.exe" if os.name == "nt" else "agy"
+
+    def tearDown(self):
+        os.chdir(self.old_cwd)
+        os.environ["PATH"] = self.old_path
+        self.tmp.cleanup()
+
+    def make(self, sub, name):
+        p = self.root / sub / name
+        p.parent.mkdir(exist_ok=True)
+        p.write_text("")
+        p.chmod(0o755)
+        return p
+
+    def test_finds_exe_in_absolute_path_entry(self):
+        p = self.make("bin", self.exe)
+        os.environ["PATH"] = str(p.parent)
+        self.assertEqual(Path(d.find_exe("agy")), p)
+
+    def test_current_and_relative_entries_are_skipped(self):
+        p = self.make("planted", self.exe)
+        os.chdir(p.parent)
+        os.environ["PATH"] = os.pathsep.join(["", ".", "planted", str(p.parent)])
+        self.assertIsNone(d.find_exe("agy"))
+
+    def test_batch_file_is_not_accepted(self):
+        if os.name != "nt":
+            self.skipTest("only Windows resolves .cmd")
+        p = self.make("bin", "agy.cmd")
+        os.environ["PATH"] = str(p.parent)
+        self.assertIsNone(d.find_exe("agy"))
 
     def test_agy_empty_success_is_failure(self):
         class P:
             returncode, stderr = 0, ""
             stdout = '{"status":"SUCCESS","response":"\\n","usage":{"total_tokens":5}}'
-        real_run, real_which = d._run, d.shutil.which
-        d._run, d.shutil.which = lambda *a, **k: P, lambda n: r"C:\tools\agy.exe"
+        real_run, real_find = d._run, d.find_exe
+        d._run, d.find_exe = lambda *a, **k: P, lambda n: "agy"
         try:
-            self.assertFalse(d.run_agy("q", ".", False, None, 5).ok)
+            self.assertFalse(d.run_agy("q", ".", False, {}, 5).ok)
         finally:
-            d._run, d.shutil.which = real_run, real_which
-
-    def test_cwd_is_not_searched(self):
-        d.find_exe("python")
-        self.assertEqual(os.environ["NoDefaultCurrentDirectoryInExePath"], "1")
+            d._run, d.find_exe = real_run, real_find
 
 
 class Fallback(unittest.TestCase):

@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """Hand a prompt to Codex or Antigravity (agy) and fall back when a subscription runs out.
 
-    delegate.py run [--providers agy,codex] [--cwd DIR] [--write] PROMPT|-
+    delegate.py run [--providers agy,codex] [--cwd DIR] [--write] [--model [P=]M] [--effort [P=]E] PROMPT|-
+    delegate.py models [--json]
     delegate.py status [--json]
     delegate.py reset [PROVIDER]
 
+--model and --effort are repeatable. With several providers prefix the value with the provider
+(`--model codex=gpt-6.1-sol --model agy=gemini-3.8-flash-low`); with one provider the prefix is optional.
+`models` lists what each provider accepts. Codex runs with --ignore-user-config and --ignore-rules (no MCP servers,
+no personal rules, fewer tokens), so its config.toml model and effort do not apply: pass --model for codex.
+
 stdout of `run` is only the model's answer; diagnostics go to stderr.
-Exit codes: 0 answered, 3 every provider is out of quota, 4 a provider failed for another reason.
+Exit codes: 0 answered, 2 bad arguments, 3 every provider is out of quota, 4 a provider failed for another reason.
 """
 import argparse
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -29,6 +34,7 @@ QUOTA_RE = re.compile(r"usage limit|rate.?limit|quota|resource.?exhausted|\b429\
                       r"|exceeded your|out of credits", re.I)
 RETRY_RE = re.compile(r"(?:try again|retry|resets?)\s+(?:in|after)\s+((?:\d+\s*[dhms]\w*[\s,]*(?:and\s+)?)+)", re.I)
 UNIT = {"d": 86400, "h": 3600, "m": 60, "s": 1}
+AGY_EFFORTS = ("low", "medium", "high", "xhigh", "max")  # from `agy --help`; per-model support is not published
 
 
 class Result:
@@ -46,12 +52,18 @@ def parse_cooldown(text):
 
 
 def find_exe(name):
-    """Path of a real executable on PATH. Never the current directory, never a .cmd/.bat (cmd.exe would reparse the prompt)."""
-    os.environ["NoDefaultCurrentDirectoryInExePath"] = "1"
-    exe = shutil.which(name)
-    if exe and Path(exe).suffix.lower() in (".cmd", ".bat"):
-        raise OSError(f"{name} resolves to {exe}; refusing to run a batch file with a prompt as argument")
-    return exe
+    """Path of a real executable found in an absolute PATH entry other than the current directory.
+
+    Only `<name>.exe` is accepted on Windows: a .cmd/.bat would be reparsed by cmd.exe with the prompt in it.
+    """
+    cwd = Path.cwd().resolve()
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if not entry or not Path(entry).is_absolute() or Path(entry).resolve() == cwd:
+            continue
+        cand = Path(entry) / (name + ".exe" if os.name == "nt" else name)
+        if cand.is_file() and (os.name == "nt" or os.access(cand, os.X_OK)):
+            return str(cand)
+    return None
 
 
 def _run(cmd, cwd, timeout, stdin_text=None):
@@ -76,17 +88,16 @@ def parse_codex(out):
     return done and bool(text), text, tokens
 
 
-def run_codex(prompt, cwd, write, model, timeout):
-    try:
-        exe = find_exe("codex")
-    except OSError as e:
-        return Result(False, err=str(e))
+def run_codex(prompt, cwd, write, o, timeout):
+    exe = find_exe("codex")
     if not exe:
         return Result(False, err="codex not installed")
-    cmd = [exe, "exec", "--skip-git-repo-check", "--ephemeral", "--json",
+    cmd = [exe, "exec", "--skip-git-repo-check", "--ephemeral", "--json", "--ignore-user-config", "--ignore-rules",
            "-s", "workspace-write" if write else "read-only", "-C", str(cwd)]
-    if model:
-        cmd += ["-m", model]
+    if o.get("model"):
+        cmd += ["-m", o["model"]]
+    if o.get("effort"):
+        cmd += ["-c", f'model_reasoning_effort="{o["effort"]}"']
     p = _run(cmd + ["-"], cwd, timeout, stdin_text=prompt)
     ok, text, tokens = parse_codex(p.stdout)
     if ok and p.returncode == 0:
@@ -119,19 +130,18 @@ def parse_agy(out):
     return None
 
 
-def run_agy(prompt, cwd, write, model, timeout):
-    try:
-        exe = find_exe("agy")
-    except OSError as e:
-        return Result(False, err=str(e))
+def run_agy(prompt, cwd, write, o, timeout):
+    exe = find_exe("agy")
     if not exe:
         return Result(False, err="agy not installed")
     if len(prompt) > MAX_ARG_PROMPT:
         return Result(False, err=f"prompt is {len(prompt)} chars; put the context in files and refer to their paths")
     cmd = [exe, f"-p={prompt}", "--output-format", "json", "--print-timeout", f"{timeout}s",
            "--mode", "accept-edits" if write else "plan"]
-    if model:
-        cmd += ["--model", model]
+    if o.get("model"):
+        cmd += ["--model", o["model"]]
+    if o.get("effort"):
+        cmd += ["--effort", o["effort"]]
     p = _run(cmd, cwd, timeout)
     data = parse_agy(p.stdout)
     # agy sometimes reports SUCCESS with an empty response; that is no answer, so let the next provider try
@@ -141,6 +151,78 @@ def run_agy(prompt, cwd, write, model, timeout):
 
 
 RUNNERS = {"codex": run_codex, "agy": run_agy}
+
+
+def codex_home():
+    return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+
+
+def codex_models(include_hidden=False):
+    """Models from Codex's own cache (efforts differ per model). [] when the cache is missing or unreadable."""
+    try:
+        data = json.loads((codex_home() / "models_cache.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [{"model": m["slug"], "default_effort": m.get("default_reasoning_level"),
+             "efforts": [e["effort"] for e in m.get("supported_reasoning_levels", [])]}
+            for m in data.get("models", []) if include_hidden or m.get("visibility") == "list"]
+
+
+def agy_models():
+    """[{model, label}] from `agy models`. [] when agy is missing or the call fails."""
+    exe = find_exe("agy")
+    if not exe:
+        return []
+    try:
+        p = _run([exe, "models"], None, 60)
+    except subprocess.TimeoutExpired:
+        return []
+    rows = [line.split("\t", 1) for line in p.stdout.splitlines() if "\t" in line]
+    return [{"model": r[0].strip(), "label": r[1].strip()} for r in rows]
+
+
+def check_options(name, o):
+    """Error text if the model/effort pair is known to be invalid for the provider, else None."""
+    model, effort = o.get("model"), o.get("effort")
+    if name == "agy" and effort and effort not in AGY_EFFORTS:
+        return f"agy effort {effort!r} is not one of {', '.join(AGY_EFFORTS)}"
+    if name == "codex" and (model or effort):
+        known = {m["model"]: m for m in codex_models(include_hidden=True)}
+        if model and known and model not in known:
+            return f"codex has no model {model!r}; known: {', '.join(m['model'] for m in codex_models())}"
+        m = known.get(model)  # without --model Codex's built-in default applies and its efforts are unknown
+        if effort and m and effort not in m["efforts"]:
+            return f"codex model {m['model']} does not support effort {effort!r}; it supports {', '.join(m['efforts'])}"
+    return None
+
+
+def per_provider(values, names, flag):
+    """Turn repeated `[provider=]value` options into {provider: value}."""
+    out = {}
+    for v in values or []:
+        head, sep, rest = v.partition("=")
+        if sep and head in RUNNERS:
+            name, val = head, rest
+        elif len(names) == 1:
+            name, val = names[0], v
+        else:
+            raise ValueError(f"{flag} {v!r}: with several providers write provider=value")
+        if name not in names:
+            raise ValueError(f"{flag} {v!r}: {name} is not in --providers")
+        if name in out:
+            raise ValueError(f"{flag} given twice for {name}")
+        out[name] = val
+    return out
+
+
+def build_options(names, models, efforts):
+    ms, es = per_provider(models, names, "--model"), per_provider(efforts, names, "--effort")
+    opts = {n: {k: v for k, v in (("model", ms.get(n)), ("effort", es.get(n))) if v} for n in names}
+    for n, o in opts.items():
+        err = check_options(n, o)
+        if err:
+            raise ValueError(err)
+    return opts
 
 
 def load_state():
@@ -158,8 +240,12 @@ def save_state(st):
     os.replace(tmp, STATE)
 
 
-def delegate(prompt, providers, cwd, write=False, model=None, timeout=600, cooldown=DEFAULT_COOLDOWN, now=time.time):
-    """Returns (exit_code, text). Tries providers in order, skipping and recording exhausted ones."""
+def delegate(prompt, providers, cwd, write=False, opts=None, timeout=600, cooldown=DEFAULT_COOLDOWN, now=time.time):
+    """Returns (exit_code, text). Tries providers in order, skipping and recording exhausted ones.
+
+    opts maps provider -> {"model", "effort"}.
+    """
+    opts = opts or {}
     st = load_state()
     quota_blocked, failed = 0, 0
     for name in providers:
@@ -170,7 +256,7 @@ def delegate(prompt, providers, cwd, write=False, model=None, timeout=600, coold
             quota_blocked += 1
             continue
         try:
-            res = RUNNERS[name](prompt, cwd, write, model, timeout)
+            res = RUNNERS[name](prompt, cwd, write, opts.get(name, {}), timeout)
         except subprocess.TimeoutExpired:
             res = Result(False, err=f"timeout after {timeout}s")
         if res.ok:
@@ -222,6 +308,24 @@ def cmd_status(args):
     return 0
 
 
+def cmd_models(args):
+    cx, ag = codex_models(), agy_models()
+    if args.json:
+        print(json.dumps({"codex": {"models": cx}, "agy": {"efforts": list(AGY_EFFORTS), "models": ag}}, indent=1))
+        return 0
+    print("codex  runs without your config.toml: always pass --model; without --effort the model's own default applies")
+    for m in cx:
+        print(f"  {m['model']:16} model default effort {m['default_effort']}; efforts: {', '.join(m['efforts'])}")
+    if not cx:
+        print(f"  (no model list: {codex_home() / 'models_cache.json'} missing or unreadable; any -m value is passed through)")
+    print(f"agy    --effort: {', '.join(AGY_EFFORTS)}; without --model the CLI picks its own default")
+    for m in ag:
+        print(f"  {m['model']:26} {m['label']}")
+    if not ag:
+        print("  (`agy models` returned nothing)")
+    return 0
+
+
 def cmd_reset(args):
     st = load_state()
     for n in ([args.provider] if args.provider else list(st)):
@@ -235,10 +339,13 @@ def cmd_run(args):
     unknown = [n for n in names if n not in RUNNERS]
     if unknown or not names:
         sys.exit(f"unknown provider(s): {unknown or 'none given'}; known: {', '.join(RUNNERS)}")
-    if args.model and len(names) != 1:
-        sys.exit("--model needs exactly one provider")
+    try:
+        opts = build_options(names, args.model, args.effort)
+    except ValueError as e:
+        print(f"[delegate] {e}", file=sys.stderr)
+        return 2
     prompt = sys.stdin.read() if args.prompt == "-" else args.prompt
-    code, text = delegate(prompt, names, Path(args.cwd).resolve(), args.write, args.model, args.timeout, args.cooldown)
+    code, text = delegate(prompt, names, Path(args.cwd).resolve(), args.write, opts, args.timeout, args.cooldown)
     if text:
         sys.stdout.write(text if text.endswith("\n") else text + "\n")
     return code
@@ -254,10 +361,14 @@ def main(argv=None):
     r.add_argument("--providers", default="agy,codex", help="try in this order (default: agy,codex)")
     r.add_argument("--cwd", default=".")
     r.add_argument("--write", action="store_true", help="allow edits in cwd (default is read-only)")
-    r.add_argument("--model")
+    r.add_argument("--model", action="append", metavar="[PROVIDER=]MODEL")
+    r.add_argument("--effort", action="append", metavar="[PROVIDER=]LEVEL", help="reasoning effort, see `models`")
     r.add_argument("--timeout", type=int, default=600)
     r.add_argument("--cooldown", type=int, default=DEFAULT_COOLDOWN, help="seconds to block a provider when no reset time is given")
     r.set_defaults(fn=cmd_run)
+    m = sub.add_parser("models", help="list the models and efforts each provider accepts")
+    m.add_argument("--json", action="store_true")
+    m.set_defaults(fn=cmd_models)
     s = sub.add_parser("status")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_status)
