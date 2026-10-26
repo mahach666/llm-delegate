@@ -45,6 +45,15 @@ def parse_cooldown(text):
     return max(total, 60) or None
 
 
+def find_exe(name):
+    """Path of a real executable on PATH. Never the current directory, never a .cmd/.bat (cmd.exe would reparse the prompt)."""
+    os.environ["NoDefaultCurrentDirectoryInExePath"] = "1"
+    exe = shutil.which(name)
+    if exe and Path(exe).suffix.lower() in (".cmd", ".bat"):
+        raise OSError(f"{name} resolves to {exe}; refusing to run a batch file with a prompt as argument")
+    return exe
+
+
 def _run(cmd, cwd, timeout, stdin_text=None):
     kw = {"input": stdin_text} if stdin_text is not None else {"stdin": subprocess.DEVNULL}
     return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, encoding="utf-8",
@@ -68,7 +77,10 @@ def parse_codex(out):
 
 
 def run_codex(prompt, cwd, write, model, timeout):
-    exe = shutil.which("codex")
+    try:
+        exe = find_exe("codex")
+    except OSError as e:
+        return Result(False, err=str(e))
     if not exe:
         return Result(False, err="codex not installed")
     cmd = [exe, "exec", "--skip-git-repo-check", "--ephemeral", "--json",
@@ -108,7 +120,10 @@ def parse_agy(out):
 
 
 def run_agy(prompt, cwd, write, model, timeout):
-    exe = shutil.which("agy")
+    try:
+        exe = find_exe("agy")
+    except OSError as e:
+        return Result(False, err=str(e))
     if not exe:
         return Result(False, err="agy not installed")
     if len(prompt) > MAX_ARG_PROMPT:
@@ -119,8 +134,9 @@ def run_agy(prompt, cwd, write, model, timeout):
         cmd += ["--model", model]
     p = _run(cmd, cwd, timeout)
     data = parse_agy(p.stdout)
-    if data and data.get("status") == "SUCCESS" and p.returncode == 0:
-        return Result(True, data.get("response", ""), data.get("usage", {}).get("total_tokens", 0))
+    # agy sometimes reports SUCCESS with an empty response; that is no answer, so let the next provider try
+    if data and data.get("status") == "SUCCESS" and p.returncode == 0 and data.get("response", "").strip():
+        return Result(True, data["response"], data.get("usage", {}).get("total_tokens", 0))
     return Result(False, err=f"exit {p.returncode}\n{p.stdout}\n{p.stderr}")
 
 

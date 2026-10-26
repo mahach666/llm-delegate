@@ -46,6 +46,31 @@ class Parsing(unittest.TestCase):
         self.assertFalse(d.QUOTA_RE.search("syntax error in file"))
 
 
+class FindExe(unittest.TestCase):
+    def test_batch_file_is_refused(self):
+        real, d.shutil.which = d.shutil.which, lambda n: r"C:\tools\agy.cmd"
+        try:
+            self.assertFalse(d.run_agy("q", ".", False, None, 5).ok)
+            self.assertIn("batch file", d.run_agy("q", ".", False, None, 5).err)
+        finally:
+            d.shutil.which = real
+
+    def test_agy_empty_success_is_failure(self):
+        class P:
+            returncode, stderr = 0, ""
+            stdout = '{"status":"SUCCESS","response":"\\n","usage":{"total_tokens":5}}'
+        real_run, real_which = d._run, d.shutil.which
+        d._run, d.shutil.which = lambda *a, **k: P, lambda n: r"C:\tools\agy.exe"
+        try:
+            self.assertFalse(d.run_agy("q", ".", False, None, 5).ok)
+        finally:
+            d._run, d.shutil.which = real_run, real_which
+
+    def test_cwd_is_not_searched(self):
+        d.find_exe("python")
+        self.assertEqual(os.environ["NoDefaultCurrentDirectoryInExePath"], "1")
+
+
 class Fallback(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
