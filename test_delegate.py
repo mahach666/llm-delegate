@@ -127,8 +127,9 @@ class Options(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("-m") + 1], "small")
         self.assertEqual(cmd[cmd.index("-c") + 1], 'model_reasoning_effort="low"')
         self.assertEqual(cmd[-1], "-")  # the prompt marker stays last
-        self.assertIn("--ignore-user-config", cmd)
-        self.assertIn("--ignore-rules", cmd)
+        # --ignore-user-config drops [windows] sandbox from config.toml and Codex then cannot run commands
+        self.assertNotIn("--ignore-user-config", cmd)
+        self.assertNotIn("--ignore-rules", cmd)
         self.assertEqual(cmd[cmd.index("-s") + 1], "read-only")
 
     def test_agy_command_line(self):
@@ -190,6 +191,81 @@ class FindExe(unittest.TestCase):
             self.assertFalse(d.run_agy("q", ".", False, {}, 5).ok)
         finally:
             d._run, d.find_exe = real_run, real_find
+
+
+class AgyRuns(unittest.TestCase):
+    def fake(self, outputs):
+        """Replace _run/find_exe; returns the list of command lines that were run."""
+        calls = []
+        queue = list(outputs)
+
+        class P:
+            returncode, stderr = 0, ""
+
+        def run(cmd, *a, **k):
+            calls.append(cmd)
+            return type("R", (P,), {"stdout": queue.pop(0)})
+        self.real = (d._run, d.find_exe)
+        d._run, d.find_exe = run, lambda n: "agy"
+        self.addCleanup(lambda: setattr(d, "_run", self.real[0]) or setattr(d, "find_exe", self.real[1]))
+        return calls
+
+    def test_read_only_prompt_gets_answer_directly_suffix(self):
+        calls = self.fake([AGY_OK])
+        d.run_agy("question", ".", False, {}, 5)
+        self.assertTrue(calls[0][1].startswith("-p=question"))
+        self.assertIn("Do not write a plan", calls[0][1])
+
+    def test_write_prompt_is_left_alone(self):
+        calls = self.fake([AGY_OK])
+        d.run_agy("edit it", ".", True, {}, 5)
+        self.assertEqual(calls[0][1], "-p=edit it")
+
+    def test_empty_success_is_retried_once(self):
+        empty = '{"status":"SUCCESS","response":"","usage":{"total_tokens":1}}'
+        calls = self.fake([empty, AGY_OK])
+        self.assertTrue(d.run_agy("q", ".", False, {}, 5).ok)
+        self.assertEqual(len(calls), 2)
+
+    def test_two_empty_successes_fail(self):
+        empty = '{"status":"SUCCESS","response":" ","usage":{"total_tokens":1}}'
+        calls = self.fake([empty, empty])
+        self.assertFalse(d.run_agy("q", ".", False, {}, 5).ok)
+        self.assertEqual(len(calls), 2)
+
+    def test_real_failure_is_not_retried(self):
+        calls = self.fake(['{"status":"ERROR","response":""}'])
+        self.assertFalse(d.run_agy("q", ".", False, {}, 5).ok)
+        self.assertEqual(len(calls), 1)
+
+
+class Check(unittest.TestCase):
+    def setUp(self):
+        self.saved = dict(d.RUNNERS)
+        self.addCleanup(lambda: (d.RUNNERS.clear(), d.RUNNERS.update(self.saved)))
+
+    def reader(self, prompt, cwd, write, o, timeout):
+        return d.Result(True, "the word is " + (Path(cwd) / "note.txt").read_text().split()[-1].rstrip("."), 5)
+
+    def test_pass_when_the_file_content_is_returned(self):
+        d.RUNNERS["agy"] = self.reader
+        self.assertTrue(d.check_provider("agy", {})[0])
+
+    def test_fail_when_the_provider_refuses(self):
+        d.RUNNERS["agy"] = lambda *a: d.Result(True, "I cannot read files here", 5)
+        ok, detail = d.check_provider("agy", {})
+        self.assertFalse(ok)
+        self.assertIn("without the word", detail)
+
+    def test_fail_when_the_provider_errors(self):
+        d.RUNNERS["agy"] = lambda *a: d.Result(False, err="boom")
+        self.assertEqual(d.check_provider("agy", {}), (False, "boom"))
+
+    def test_runs_read_only(self):
+        seen = {}
+        d.RUNNERS["agy"] = lambda p, c, write, o, t: (seen.setdefault("write", write), d.Result(False, err="x"))[1]
+        d.check_provider("agy", {})
+        self.assertFalse(seen["write"])
 
 
 class Fallback(unittest.TestCase):

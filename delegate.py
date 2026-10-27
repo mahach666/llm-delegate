@@ -3,13 +3,15 @@
 
     delegate.py run [--providers agy,codex] [--cwd DIR] [--write] [--model [P=]M] [--effort [P=]E] PROMPT|-
     delegate.py models [--json]
+    delegate.py check [--providers agy,codex] [--model [P=]M] [--effort [P=]E]
     delegate.py status [--json]
     delegate.py reset [PROVIDER]
 
 --model and --effort are repeatable. With several providers prefix the value with the provider
 (`--model codex=gpt-6.1-sol --model agy=gemini-3.8-flash-low`); with one provider the prefix is optional.
-`models` lists what each provider accepts. Codex runs with --ignore-user-config and --ignore-rules (no MCP servers,
-no personal rules, fewer tokens), so its config.toml model and effort do not apply: pass --model for codex.
+`models` lists what each provider accepts. Codex keeps your config.toml (on Windows its [windows] sandbox setting is
+what lets a read-only run execute commands at all), so without --model it uses the model set there.
+`check` runs a real read-the-file test on each provider; run it after changing flags, models or either CLI.
 
 stdout of `run` is only the model's answer; diagnostics go to stderr.
 Exit codes: 0 answered, 2 bad arguments, 3 every provider is out of quota, 4 a provider failed for another reason.
@@ -35,6 +37,8 @@ QUOTA_RE = re.compile(r"usage limit|rate.?limit|quota|resource.?exhausted|\b429\
 RETRY_RE = re.compile(r"(?:try again|retry|resets?)\s+(?:in|after)\s+((?:\d+\s*[dhms]\w*[\s,]*(?:and\s+)?)+)", re.I)
 UNIT = {"d": 86400, "h": 3600, "m": 60, "s": 1}
 AGY_EFFORTS = ("low", "medium", "high", "xhigh", "max")  # from `agy --help`; per-model support is not published
+# In --mode plan agy often answers with "I prepared a plan, please approve it" instead of the answer; this steers it.
+AGY_SUFFIX = "\n\nReply with the answer as plain text in this message. Do not write a plan or create any files."
 
 
 class Result:
@@ -92,7 +96,8 @@ def run_codex(prompt, cwd, write, o, timeout):
     exe = find_exe("codex")
     if not exe:
         return Result(False, err="codex not installed")
-    cmd = [exe, "exec", "--skip-git-repo-check", "--ephemeral", "--json", "--ignore-user-config", "--ignore-rules",
+    # Do not add --ignore-user-config: it drops [windows] sandbox from config.toml and Codex then cannot run any command
+    cmd = [exe, "exec", "--skip-git-repo-check", "--ephemeral", "--json",
            "-s", "workspace-write" if write else "read-only", "-C", str(cwd)]
     if o.get("model"):
         cmd += ["-m", o["model"]]
@@ -134,6 +139,8 @@ def run_agy(prompt, cwd, write, o, timeout):
     exe = find_exe("agy")
     if not exe:
         return Result(False, err="agy not installed")
+    if not write:
+        prompt += AGY_SUFFIX
     if len(prompt) > MAX_ARG_PROMPT:
         return Result(False, err=f"prompt is {len(prompt)} chars; put the context in files and refer to their paths")
     cmd = [exe, f"-p={prompt}", "--output-format", "json", "--print-timeout", f"{timeout}s",
@@ -142,11 +149,15 @@ def run_agy(prompt, cwd, write, o, timeout):
         cmd += ["--model", o["model"]]
     if o.get("effort"):
         cmd += ["--effort", o["effort"]]
-    p = _run(cmd, cwd, timeout)
-    data = parse_agy(p.stdout)
-    # agy sometimes reports SUCCESS with an empty response; that is no answer, so let the next provider try
-    if data and data.get("status") == "SUCCESS" and p.returncode == 0 and data.get("response", "").strip():
-        return Result(True, data["response"], data.get("usage", {}).get("total_tokens", 0))
+    for _ in range(2):
+        p = _run(cmd, cwd, timeout)
+        data = parse_agy(p.stdout)
+        success = bool(data) and data.get("status") == "SUCCESS" and p.returncode == 0
+        if success and data.get("response", "").strip():
+            return Result(True, data["response"], data.get("usage", {}).get("total_tokens", 0))
+        if not success:
+            break
+        # agy often reports SUCCESS with an empty response (roughly one run in three); once more is cheaper than failing over
     return Result(False, err=f"exit {p.returncode}\n{p.stdout}\n{p.stderr}")
 
 
@@ -313,7 +324,7 @@ def cmd_models(args):
     if args.json:
         print(json.dumps({"codex": {"models": cx}, "agy": {"efforts": list(AGY_EFFORTS), "models": ag}}, indent=1))
         return 0
-    print("codex  runs without your config.toml: always pass --model; without --effort the model's own default applies")
+    print("codex  without --model/--effort the values from your config.toml apply")
     for m in cx:
         print(f"  {m['model']:16} model default effort {m['default_effort']}; efforts: {', '.join(m['efforts'])}")
     if not cx:
@@ -334,15 +345,52 @@ def cmd_reset(args):
     return 0
 
 
-def cmd_run(args):
+def check_provider(name, opts, timeout=300):
+    """Have the provider read a file whose content it can only learn by reading it. Returns (ok, detail)."""
+    word = "check-" + os.urandom(4).hex()
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+        (Path(d) / "note.txt").write_text(f"The secret word is {word}.\n", encoding="utf-8")
+        started = time.time()
+        try:
+            res = RUNNERS[name]("Read the file note.txt in the current directory and print the secret word it contains.",
+                                Path(d), False, opts.get(name, {}), timeout)
+        except subprocess.TimeoutExpired:
+            return False, f"timeout after {timeout}s"
+    if not res.ok:
+        return False, res.err.strip()[:300]
+    if word not in res.text:
+        return False, "answered without the word: " + res.text.strip()[:200]
+    return True, f"{res.tokens} tokens, {time.time() - started:.0f}s"
+
+
+def cmd_check(args):
+    names, opts = providers_and_options(args)
+    if opts is None:
+        return 2
+    code = 0
+    for n in names:
+        ok, detail = check_provider(n, opts, args.timeout)
+        print(f"{n:6} {'PASS' if ok else 'FAIL'}  {detail}")
+        code = code or (0 if ok else 4)
+    return code
+
+
+def providers_and_options(args):
+    """(names, opts) from --providers/--model/--effort; opts is None after printing an error."""
     names = [n.strip() for n in args.providers.split(",") if n.strip()]
     unknown = [n for n in names if n not in RUNNERS]
     if unknown or not names:
         sys.exit(f"unknown provider(s): {unknown or 'none given'}; known: {', '.join(RUNNERS)}")
     try:
-        opts = build_options(names, args.model, args.effort)
+        return names, build_options(names, args.model, args.effort)
     except ValueError as e:
         print(f"[delegate] {e}", file=sys.stderr)
+        return names, None
+
+
+def cmd_run(args):
+    names, opts = providers_and_options(args)
+    if opts is None:
         return 2
     prompt = sys.stdin.read() if args.prompt == "-" else args.prompt
     code, text = delegate(prompt, names, Path(args.cwd).resolve(), args.write, opts, args.timeout, args.cooldown)
@@ -369,6 +417,12 @@ def main(argv=None):
     m = sub.add_parser("models", help="list the models and efforts each provider accepts")
     m.add_argument("--json", action="store_true")
     m.set_defaults(fn=cmd_models)
+    c = sub.add_parser("check", help="make each provider read a test file; spends tokens on every provider")
+    c.add_argument("--providers", default="agy,codex")
+    c.add_argument("--model", action="append", metavar="[PROVIDER=]MODEL")
+    c.add_argument("--effort", action="append", metavar="[PROVIDER=]LEVEL")
+    c.add_argument("--timeout", type=int, default=300)
+    c.set_defaults(fn=cmd_check)
     s = sub.add_parser("status")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_status)

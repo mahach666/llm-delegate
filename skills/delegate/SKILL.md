@@ -15,8 +15,11 @@ If the path is not already known from the project or user instructions, find the
   Exit code: 0 answered, 2 bad arguments, 3 every provider is out of quota, 4 a provider failed for another reason.
   With several providers prefix each value: `--model codex=gpt-6-luna --model agy=gemini-3.8-flash-low`.
 - `models` lists the models and efforts each provider accepts on this machine. Trust it over the table below.
+- `check [--providers ...] [--model ...] [--effort ...]` makes each provider read a test file and prints PASS or FAIL.
+  It spends 20 000 to 45 000 tokens per provider. Run it once before the first real delegation in a session and
+  whenever an answer looks wrong. A provider can say "I can't read files" and still exit 0, and `run` cannot tell.
 - `status` shows calls, tokens and out-of-quota marks. `reset [provider]` clears a mark.
-- Codex runs without the user's `config.toml` and personal rules, so always pass `--model` for it.
+- Without `--model`, Codex uses the model from the user's `config.toml`.
 - Default is read-only (Codex `-s read-only`, agy `--mode plan`). `--write` allows edits in `--cwd`.
 
 ## When to delegate
@@ -35,8 +38,8 @@ trust-boundary code; work under about 40 lines (the brief would be longer than t
 following live; anything that depends on the current conversation; and **any secret** (`.env`, keys, tokens):
 the prompt and the files the provider reads go to a third-party service.
 
-Each call costs roughly 12 000 to 30 000 tokens of the provider's quota before any real work, so small tasks are a
-net loss.
+Calls are expensive: measured, a one-line question about a one-line file cost about 23 000 tokens with agy and
+35 000 to 80 000 with Codex; a one-line `--write` edit 60 000 to 120 000. Small tasks are a net loss.
 
 ## Choosing model and effort
 
@@ -46,12 +49,24 @@ rests on its author's benchmark reading. It has not been verified here. Change i
 | Task | Provider | Model | Effort |
 |------|----------|-------|--------|
 | Large implementation from a written spec | codex | `gpt-6.1-sol` | `high` |
-| Small mechanical edits | codex | `gpt-6-luna` | `medium` |
+| Small mechanical edits | codex | `gpt-6-luna` with `--write` only | `medium` |
 | Long reading, documents, reading code without edits | agy | `gemini-3.8-flash-low` or `-medium` | model's own |
 | Diff review, second opinion | codex | `gpt-6-astra` | `low`, read-only |
 
 Do not go above `high`: the gain is small and the cost two to three times higher. `--write` only in a separate
 branch or worktree, never in a working copy someone is using.
+
+Observed on this machine (read-only file read, `check`): `gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-sol`, `gpt-5.6-luna`,
+`gpt-5.6-terra` passed; `gpt-6-luna` failed 3 of 3 ("can't read files") yet edited correctly with `--write`. For
+agy, `gemini-3.8-flash-low`, `-medium` and `-high` passed, but agy often returns an empty answer (retried once
+automatically) and in plan mode may answer with a plan instead of the answer. Treat the table as a prior and trust
+what `check` shows.
+
+## When an answer looks wrong
+
+If the answer is an apology ("can't read files"), a plan awaiting approval, or says access was blocked: that is a
+failed delegation even though the exit code is 0. Do not re-run the same call in a loop (each costs 20 000+ tokens).
+Run `check` for that provider and model, switch to a model that passes, or do the work directly.
 
 ## Writing the brief
 
