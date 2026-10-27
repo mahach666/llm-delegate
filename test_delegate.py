@@ -1,6 +1,10 @@
+import argparse
 import json
 import os
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -127,9 +131,8 @@ class Options(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("-m") + 1], "small")
         self.assertEqual(cmd[cmd.index("-c") + 1], 'model_reasoning_effort="low"')
         self.assertEqual(cmd[-1], "-")  # the prompt marker stays last
-        # --ignore-user-config drops [windows] sandbox from config.toml and Codex then cannot run commands
-        self.assertNotIn("--ignore-user-config", cmd)
-        self.assertNotIn("--ignore-rules", cmd)
+        self.assertIn("--ignore-user-config", cmd)  # keeps the user's MCP servers and notify command out of the run
+        self.assertIn("--ignore-rules", cmd)
         self.assertEqual(cmd[cmd.index("-s") + 1], "read-only")
 
     def test_agy_command_line(self):
@@ -137,6 +140,36 @@ class Options(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--model") + 1], "m")
         self.assertEqual(cmd[cmd.index("--effort") + 1], "max")
         self.assertEqual(cmd[cmd.index("--mode") + 1], "plan")
+
+    def write_config(self, text):
+        (Path(self.tmp.name) / "config.toml").write_text(text, encoding="utf-8")
+
+    @unittest.skipUnless(os.name == "nt", "[windows] sandbox only applies on Windows")
+    def test_windows_sandbox_is_passed_back_from_user_config(self):
+        self.write_config("\n".join(['model = "x"', "[windows]", 'sandbox = "elevated"', "[mcp_servers.figma]", 'url = "u"']))
+        self.assertEqual(d.codex_windows_sandbox(), "elevated")
+        cmd = self.run_with_fake_process(d.run_codex, {})
+        self.assertEqual(cmd[cmd.index("-c") + 1], 'windows.sandbox="elevated"')
+
+    @unittest.skipUnless(os.name == "nt", "[windows] sandbox only applies on Windows")
+    def test_no_sandbox_override_without_the_setting(self):
+        self.write_config('model = "x"')
+        self.assertIsNone(d.codex_windows_sandbox())
+        self.assertNotIn("-c", self.run_with_fake_process(d.run_codex, {}))
+
+    @unittest.skipUnless(os.name == "nt", "[windows] sandbox only applies on Windows")
+    def test_unusable_config_is_reported_and_skipped(self):
+        import contextlib
+        import io
+        for text in ("this is = not [valid", "[windows]\nsandbox = 'a b; rm'"):
+            self.write_config(text)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertIsNone(d.codex_windows_sandbox())
+            self.assertIn("not passed on", err.getvalue())
+
+    def test_missing_config_is_not_an_error(self):
+        self.assertIsNone(d.codex_windows_sandbox())
 
     def test_no_options_adds_no_model_flags(self):
         cmd = self.run_with_fake_process(d.run_codex, {})
@@ -193,6 +226,40 @@ class FindExe(unittest.TestCase):
             d._run, d.find_exe = real_run, real_find
 
 
+class Timeouts(unittest.TestCase):
+    def test_timeout_kills_grandchildren_and_returns_on_time(self):
+        marker = Path(tempfile.mkdtemp()) / "grandchild-survived.txt"
+        grandchild = f"import time; time.sleep(4); open({str(marker)!r}, 'w').close()"
+        parent = (f"import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', {grandchild!r}]); time.sleep(60)")
+        started = time.time()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            d._run([sys.executable, "-c", parent], None, 1)
+        self.assertLess(time.time() - started, 3.5)  # plain subprocess.run waits for the grandchild's pipe, ~4 s here
+        time.sleep(5)
+        self.assertFalse(marker.exists(), "the grandchild kept running after the timeout")
+
+    def test_zero_means_no_limit(self):
+        self.assertEqual(d._run([sys.executable, "-c", "print('hi')"], None, 0).stdout.strip(), "hi")
+
+    def test_seconds_argument(self):
+        self.assertEqual(d.seconds("0"), 0)
+        self.assertEqual(d.seconds("600"), 600)
+        with self.assertRaises(argparse.ArgumentTypeError):
+            d.seconds("-1")
+
+    def test_agy_gets_zero_print_timeout_for_no_limit(self):
+        seen = {}
+        real_run, real_find = d._run, d.find_exe
+        d._run = lambda cmd, *a, **k: (seen.setdefault("cmd", cmd), type("R", (), {"returncode": 0, "stderr": "", "stdout": AGY_OK}))[1]
+        d.find_exe = lambda n: "agy"
+        try:
+            d.run_agy("q", ".", False, {}, 0)
+        finally:
+            d._run, d.find_exe = real_run, real_find
+        cmd = seen["cmd"]
+        self.assertEqual(cmd[cmd.index("--print-timeout") + 1], "0s")
+
+
 class AgyRuns(unittest.TestCase):
     def fake(self, outputs):
         """Replace _run/find_exe; returns the list of command lines that were run."""
@@ -237,6 +304,137 @@ class AgyRuns(unittest.TestCase):
         calls = self.fake(['{"status":"ERROR","response":""}'])
         self.assertFalse(d.run_agy("q", ".", False, {}, 5).ok)
         self.assertEqual(len(calls), 1)
+
+
+class ExternalData(unittest.TestCase):
+    """Output and files written by other programs are not guaranteed to have the shape we expect."""
+
+    def test_codex_stream_with_odd_fields_does_not_crash(self):
+        stream = "\n".join(['{"item": null}', '{"error": "rate limit reached"}', '{"error": null}', "123", '"text"',
+                            '{"type":"item.completed","item":null}', '{"type":"turn.completed","usage":null}'])
+        self.assertEqual(d.parse_codex(stream), (False, "", 0))
+        self.assertEqual(d.codex_errors(stream), "rate limit reached")
+
+    def test_agy_result_found_among_noise(self):
+        out = "\n".join(["{debug: not json", AGY_OK, "{another broken line", "[1, 2]"])
+        self.assertEqual(d.parse_agy(out)["usage"]["total_tokens"], 12702)
+        self.assertIsNone(d.parse_agy("[1]\nnothing here"))
+
+    def test_damaged_state_file_is_reported_not_fatal(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as tmp:
+            real = d.STATE
+            d.STATE = Path(tmp) / "state.json"
+            try:
+                for text in ("", "{not json", "[1, 2]"):
+                    d.STATE.write_text(text, encoding="utf-8")
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err):
+                        self.assertEqual(d.load_state(), {})
+                    self.assertIn("empty state", err.getvalue())
+            finally:
+                d.STATE = real
+
+    def test_models_cache_with_null_and_incomplete_entries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "models_cache.json").write_text(json.dumps({"models": [
+                {"slug": "a", "visibility": "list", "supported_reasoning_levels": None},
+                {"visibility": "list"}, "junk", {"slug": "b", "visibility": "list", "supported_reasoning_levels": [{"x": 1}, {"effort": "low"}]},
+            ]}), encoding="utf-8")
+            old = os.environ.get("CODEX_HOME")
+            os.environ["CODEX_HOME"] = tmp
+            try:
+                self.assertEqual([(m["model"], m["efforts"]) for m in d.codex_models()], [("a", []), ("b", ["low"])])
+            finally:
+                if old is None:
+                    del os.environ["CODEX_HOME"]
+                else:
+                    os.environ["CODEX_HOME"] = old
+
+    @unittest.skipUnless(os.name == "nt", "[windows] sandbox only applies on Windows")
+    def test_non_table_windows_key_in_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "config.toml").write_text("windows = false\n", encoding="utf-8")
+            old = os.environ.get("CODEX_HOME")
+            os.environ["CODEX_HOME"] = tmp
+            try:
+                self.assertIsNone(d.codex_windows_sandbox())
+            finally:
+                if old is None:
+                    del os.environ["CODEX_HOME"]
+                else:
+                    os.environ["CODEX_HOME"] = old
+
+
+class Robustness(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.real_state, d.STATE = d.STATE, Path(self.tmp.name) / "state.json"
+        self.saved = dict(d.RUNNERS)
+
+    def tearDown(self):
+        d.STATE = self.real_state
+        d.RUNNERS.clear()
+        d.RUNNERS.update(self.saved)
+        self.tmp.cleanup()
+
+    def test_provider_that_cannot_start_falls_through_to_the_next(self):
+        def cannot_start(*a):
+            raise NotADirectoryError("bad cwd")
+        d.RUNNERS["agy"] = cannot_start
+        d.RUNNERS["codex"] = lambda *a: d.Result(True, "A", 1)
+        self.assertEqual(d.delegate("q", ["agy", "codex"], "."), (0, "A"))
+        self.assertIn("could not start agy", d.load_state()["agy"]["last_error"])
+
+    def test_state_entry_without_history_is_repaired(self):
+        d.STATE.write_text(json.dumps({"agy": {"last_error": "old"}}), encoding="utf-8")
+        d.RUNNERS["agy"] = lambda *a: d.Result(True, "A", 3)
+        self.assertEqual(d.delegate("q", ["agy"], "."), (0, "A"))
+        self.assertEqual(len(d.load_state()["agy"]["history"]), 1)
+
+    def test_unknown_provider_is_exit_code_2(self):
+        args = argparse.Namespace(providers="nope", model=None, effort=None, prompt="q", cwd=".", write=False,
+                                  timeout=5, cooldown=1)
+        self.assertEqual(d.cmd_run(args), 2)
+        self.assertEqual(d.cmd_check(argparse.Namespace(providers="nope", model=None, effort=None, timeout=5)), 2)
+
+    @unittest.skipUnless(os.name == "nt", "the command line limit is a Windows one")
+    def test_quoting_that_overflows_the_windows_command_line_is_refused(self):
+        called = []
+        real_run, real_find = d._run, d.find_exe
+        d._run, d.find_exe = lambda *a, **k: called.append(1), lambda n: "agy"
+        try:
+            res = d.run_agy('"' * 20000, ".", False, {}, 5)  # 20 000 characters, over 40 000 once quoted
+        finally:
+            d._run, d.find_exe = real_run, real_find
+        self.assertFalse(res.ok)
+        self.assertIn("too long", res.err)
+        self.assertEqual(called, [])
+
+    def agy_runs(self, outputs):
+        calls = []
+        queue = list(outputs)
+        real_run, real_find = d._run, d.find_exe
+        d._run = lambda cmd, *a, **k: (calls.append(cmd), type("R", (), {"returncode": 0, "stderr": "", "stdout": queue.pop(0)}))[1]
+        d.find_exe = lambda n: "agy"
+        self.addCleanup(lambda: (setattr(d, "_run", real_run), setattr(d, "find_exe", real_find)))
+        return calls
+
+    def test_quick_empty_answer_is_retried(self):
+        empty = '{"status":"SUCCESS","response":"","duration_seconds":12}'
+        calls = self.agy_runs([empty, AGY_OK])
+        self.assertTrue(d.run_agy("q", ".", False, {}, 5).ok)
+        self.assertEqual(len(calls), 2)
+
+    def test_slow_empty_answer_is_not_paid_for_twice(self):
+        empty = '{"status":"SUCCESS","response":"","duration_seconds":250}'
+        calls = self.agy_runs([empty, AGY_OK])
+        self.assertFalse(d.run_agy("q", ".", False, {}, 5).ok)
+        self.assertEqual(len(calls), 1)
+
+    def test_suffix_forbids_shell_commands(self):
+        self.assertIn("cannot run shell commands", d.AGY_SUFFIX)
 
 
 class Check(unittest.TestCase):

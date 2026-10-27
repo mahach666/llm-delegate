@@ -19,8 +19,20 @@ If the path is not already known from the project or user instructions, find the
   It spends 20 000 to 45 000 tokens per provider. Run it once before the first real delegation in a session and
   whenever an answer looks wrong. A provider can say "I can't read files" and still exit 0, and `run` cannot tell.
 - `status` shows calls, tokens and out-of-quota marks. `reset [provider]` clears a mark.
-- Without `--model`, Codex uses the model from the user's `config.toml`.
+- Codex runs without the user's `config.toml` (their MCP servers, `notify` command and rules stay out), so it uses its
+  own default model unless you pass `--model`. The one setting kept from that file is `[windows] sandbox`.
 - Default is read-only (Codex `-s read-only`, agy `--mode plan`). `--write` allows edits in `--cwd`.
+
+## Long tasks
+
+`--timeout SECONDS` is per provider (default 600; `0` = no limit). It is an arbitrary default, not a limit of either
+CLI. On expiry the provider's whole process tree is killed and the next provider is tried.
+
+If a task may run longer than the host's foreground command limit (often about 10 minutes), do not run it in the
+foreground: start the whole `delegate.py run ...` command in the background (for example with the shell tool's
+background option) with `--timeout 0` or a large value, keep working or wait, and read the output when it finishes.
+Do not poll in a loop and do not start a second identical call. A silent run is not necessarily stuck, so decide
+from the elapsed time and the task size, and stop it deliberately if you give up.
 
 ## When to delegate
 
@@ -39,7 +51,7 @@ following live; anything that depends on the current conversation; and **any sec
 the prompt and the files the provider reads go to a third-party service.
 
 Calls are expensive: measured, a one-line question about a one-line file cost about 23 000 tokens with agy and
-35 000 to 80 000 with Codex; a one-line `--write` edit 60 000 to 120 000. Small tasks are a net loss.
+30 000 to 40 000 with Codex; a one-line `--write` edit about 36 000 (`gpt-6.1-sol`). Small tasks are a net loss.
 
 ## Choosing model and effort
 
@@ -50,17 +62,24 @@ rests on its author's benchmark reading. It has not been verified here. Change i
 |------|----------|-------|--------|
 | Large implementation from a written spec | codex | `gpt-6.1-sol` | `high` |
 | Small mechanical edits | codex | `gpt-6-luna` with `--write` only | `medium` |
-| Long reading, documents, reading code without edits | agy | `gemini-3.8-flash-low` or `-medium` | model's own |
-| Diff review, second opinion | codex | `gpt-6-astra` | `low`, read-only |
+| Long reading, summarising documents or logs | agy | `gemini-3.8-flash-low` or `-medium` | model's own |
+| Code review, diff review, second opinion | codex | `gpt-6-astra` or `gpt-6.1-sol` | `low`, read-only |
 
 Do not go above `high`: the gain is small and the cost two to three times higher. `--write` only in a separate
 branch or worktree, never in a working copy someone is using.
 
 Observed on this machine (read-only file read, `check`): `gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-sol`, `gpt-5.6-luna`,
-`gpt-5.6-terra` passed; `gpt-6-luna` failed 3 of 3 ("can't read files") yet edited correctly with `--write`. For
-agy, `gemini-3.8-flash-low`, `-medium` and `-high` passed, but agy often returns an empty answer (retried once
-automatically) and in plan mode may answer with a plan instead of the answer. Treat the table as a prior and trust
-what `check` shows.
+`gpt-5.6-terra` passed; `gpt-6-luna` failed 4 of 5 ("can't read files") yet edited correctly with `--write`. For
+agy, `gemini-3.8-flash-low`, `-medium` and `-high` passed. agy can return an empty answer: in the case inspected
+the model had tried to run a shell command, which nobody can approve in headless plan mode, so the turn ended
+without text. The tool tells agy not to run commands, and a quick empty answer is retried once. In plan mode agy may
+also answer with a plan awaiting approval instead of the answer.
+
+For a code review of one 480-line file, agy (flash-medium) took 4 to 5 minutes and about 90 000 tokens, Codex 40
+seconds and 154 000 tokens. Codex found four real defects (all confirmed by hand); agy found different, smaller ones
+and missed those four. Another session reported agy flash models inventing findings on a one-file review. So: send
+code review to Codex, use agy for reading and summarising, and check every finding against the code. Treat the table
+as a prior and trust what `check` shows.
 
 ## When an answer looks wrong
 

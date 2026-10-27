@@ -27,7 +27,8 @@ $ python delegate.py run --providers agy,codex "Read src/ and summarise the modu
 
 ## Requirements
 
-- Python 3 (developed and tested on 3.14 on Windows 11; other versions and other systems are untested).
+- Python 3.11 or newer (`tomllib`). Developed and tested on 3.14 on Windows 11; other versions and other systems are
+  untested.
 - `codex` and/or `agy` installed, on `PATH` and already signed in. This tool does not log in for you.
 
 ## Usage
@@ -53,9 +54,13 @@ python delegate.py run --providers agy,codex --model agy=gemini-3.8-flash-low --
 ```
 
 `python delegate.py models` lists what each provider accepts on the current machine: Codex's list comes from its own
-`models_cache.json`, `agy`'s from `agy models`. Without `--model`, Codex uses the model from your `config.toml`.
-Codex keeps that file on purpose: on Windows its `[windows] sandbox` setting is what lets a read-only run execute any
-command. Starting Codex with `--ignore-user-config` made it unable to read files, so the tool does not use that flag.
+`models_cache.json`, `agy`'s from `agy models`.
+
+Codex is started with `--ignore-user-config --ignore-rules`, so the MCP servers, `notify` command and rules from your
+`config.toml` do not run inside a delegated session, and without `--model` Codex uses its own default model, not the
+one from that file. Pass `--model`. Those flags also drop `[windows] sandbox`, without which Codex on Windows cannot
+run any command and answers that it can't read files. The tool therefore reads that one value from your `config.toml`
+and passes it back with `-c windows.sandbox=...`.
 
 ### Check
 
@@ -76,6 +81,13 @@ codex  available | calls 5h/24h/7d 2/5/5 | tokens 24h 61207
 agy    OUT OF QUOTA until 19:48 | calls 5h/24h/7d 1/3/3 | tokens 24h 38120 | last error: ...
 $ python delegate.py reset agy      # clear the mark if you know the quota is back
 ```
+
+### Long tasks
+
+`--timeout SECONDS` is per provider and defaults to 600. When it expires the provider is killed together with
+everything it started, and the next provider is tried. `--timeout 0` means no limit. A caller whose shell tool caps
+foreground commands (often around 10 minutes) should start the whole `delegate.py` command in the background and read
+the result when it finishes, with `--timeout 0` or a large value.
 
 ### Exit codes
 
@@ -103,8 +115,8 @@ Set `LLM_DELEGATE_STATE` to use another file.
 - `agy` receives the prompt as a command-line argument, so prompts over 30 000 characters are refused. Put large
   context in files and refer to their paths. Codex receives the prompt on stdin and has no such limit.
 - Calls are expensive. Measured on one machine, answering a one-line question about a one-line file used about 23 000
-  tokens with `agy` and 35 000 to 80 000 with Codex, and a one-line edit with `--write` 60 000 to 120 000. Tiny
-  prompts are a poor trade.
+  tokens with `agy` and 30 000 to 40 000 with Codex, and a one-line edit with `--write` about 36 000 (`gpt-6.1-sol`).
+  Reading two files with Codex cost 85 000 before the isolation flags were added. Tiny prompts are a poor trade.
 
 ## Known limitations
 
@@ -115,13 +127,24 @@ Set `LLM_DELEGATE_STATE` to use another file.
   an answer to `run`). `agy` in plan mode may say "I prepared a plan, please approve it"; the tool appends an
   instruction to answer in plain text, which fixed it in testing (3 of 3), but it is not a guarantee. Read answers
   critically and run `check` when results look wrong.
-- On one Windows machine `gpt-6-luna` answered "I can't read files" in read-only mode on every try (3 of 3), while it
+- On one Windows machine `gpt-6-luna` answered "I can't read files" in read-only mode on 4 of 5 tries, while it
   edited files fine with `--write`, and the other Codex models tested read normally. Model behaviour differs per
   machine and over time, which is what `check` is for.
-- `agy` often reports success with an empty answer (about one run in three in testing). The tool retries once, then
-  treats it as a failure.
-- A long `agy` run once hit the 600 second timeout in real use; this was not reproduced with small prompts (10 to 40
-  seconds). Keep delegated prompts scoped and lower `--timeout` if you would rather fail early.
+- `agy` sometimes reports success with an empty answer. In the case inspected in agy's conversation database the model
+  had tried to run a shell command; headless plan mode has nobody to approve it, the permission is denied
+  ("user denied permission to run command") and the turn ends without text. The tool therefore tells `agy` up front
+  that commands are denied and to read files with its file viewer. Reviews of one 480-line file, empty before the
+  change, gave a real answer in all three runs after it (4 to 5 minutes and 90 000 to 105 000 tokens each); an empty
+  answer that came back within 60 seconds is retried once, a slower one is not, so a long run is not paid for twice.
+- On that same review Codex took 40 seconds and 154 000 tokens and found four real defects in the tool, all confirmed
+  by hand; `agy` found different, smaller ones (damaged state file, unexpected JSON shapes) and missed those four.
+  The two were complementary, and neither replaces running the tests.
+- The default timeout (600 seconds per provider) is an arbitrary choice, not a limit of either CLI: `agy` itself waits
+  for the end of the turn without one. A real `agy` run once hit it; small prompts take 10 to 40 seconds. Use
+  `--timeout 0` for tasks that may run for hours (see Long tasks).
+- Killing a timed-out provider takes its whole process tree (`taskkill /T` on Windows, a process group elsewhere).
+  Verified on Windows for Codex with a long command running as its child. For `agy` no long child process could be
+  provoked, so that case is untested, and the tree kill cannot reach a grandchild whose parent already exited.
 - Remaining quota is not known in advance, only after a failure.
 - `--write` is available but has had very little real use; keep it to a separate branch or worktree.
 - Only Codex and `agy` are supported. `gemini` CLI is not, because it needs its own sign-in.

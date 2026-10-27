@@ -9,9 +9,14 @@
 
 --model and --effort are repeatable. With several providers prefix the value with the provider
 (`--model codex=gpt-6.1-sol --model agy=gemini-3.8-flash-low`); with one provider the prefix is optional.
-`models` lists what each provider accepts. Codex keeps your config.toml (on Windows its [windows] sandbox setting is
-what lets a read-only run execute commands at all), so without --model it uses the model set there.
+`models` lists what each provider accepts. Codex runs with --ignore-user-config and --ignore-rules, so your MCP
+servers, `notify` command and rules do not apply and Codex's own default model is used unless you pass --model. The
+one setting passed back is `[windows] sandbox` (without it Codex cannot run commands on Windows).
 `check` runs a real read-the-file test on each provider; run it after changing flags, models or either CLI.
+
+`--timeout SECONDS` (default 600; 0 = no limit) is per provider; when it expires the provider's whole process tree is
+killed and the next provider is tried. For tasks that run longer than your shell tool allows in the foreground,
+start the whole command in the background and use `--timeout 0` or a large value.
 
 stdout of `run` is only the model's answer; diagnostics go to stderr.
 Exit codes: 0 answered, 2 bad arguments, 3 every provider is out of quota, 4 a provider failed for another reason.
@@ -20,10 +25,12 @@ import argparse
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from pathlib import Path
 
 STATE = Path(os.environ.get("LLM_DELEGATE_STATE")
@@ -31,14 +38,20 @@ STATE = Path(os.environ.get("LLM_DELEGATE_STATE")
 DEFAULT_COOLDOWN = 3600  # shortcut: used when the CLI gives no reset time, one retry per hour costs one cheap failed call
 HISTORY_CAP = 1000
 MAX_ARG_PROMPT = 30000  # agy takes the prompt as an argument; Windows caps a command line near 32k
+MAX_WINDOWS_CMDLINE = 32000  # CreateProcess fails above 32767 characters
+EMPTY_RETRY_MAX_SECONDS = 60  # an empty agy answer is retried once only if the first try was this quick
 # shortcut: patterns are guesses from public reports, not captured from a real exhausted account; extend on first real miss
 QUOTA_RE = re.compile(r"usage limit|rate.?limit|quota|resource.?exhausted|\b429\b|too many requests"
                       r"|exceeded your|out of credits", re.I)
 RETRY_RE = re.compile(r"(?:try again|retry|resets?)\s+(?:in|after)\s+((?:\d+\s*[dhms]\w*[\s,]*(?:and\s+)?)+)", re.I)
 UNIT = {"d": 86400, "h": 3600, "m": 60, "s": 1}
 AGY_EFFORTS = ("low", "medium", "high", "xhigh", "max")  # from `agy --help`; per-model support is not published
-# In --mode plan agy often answers with "I prepared a plan, please approve it" instead of the answer; this steers it.
-AGY_SUFFIX = "\n\nReply with the answer as plain text in this message. Do not write a plan or create any files."
+# In --mode plan agy often answers with "I prepared a plan, please approve it" instead of the answer. And when it tries
+# to run a shell command nobody can approve it, the permission is denied and the turn ends with an empty response
+# (seen in agy's conversation database: "user denied permission to run command"). This steers it away from both.
+AGY_SUFFIX = ("\n\nReply with the answer as plain text in this message. Do not write a plan or create any files. "
+              "You cannot run shell commands here: any command is denied and ends the session without an answer. "
+              "Read files with your file-viewing tool only.")
 
 
 class Result:
@@ -70,25 +83,62 @@ def find_exe(name):
     return None
 
 
+def kill_tree(proc):
+    """Kill proc and everything it started. proc.kill() alone leaves grandchildren running."""
+    if os.name == "nt":
+        taskkill = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "taskkill.exe"
+        subprocess.run([str(taskkill), "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+    else:
+        os.killpg(proc.pid, signal.SIGKILL)  # the child leads its own session, see _run
+
+
 def _run(cmd, cwd, timeout, stdin_text=None):
-    kw = {"input": stdin_text} if stdin_text is not None else {"stdin": subprocess.DEVNULL}
-    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, encoding="utf-8",
-                          errors="replace", timeout=timeout, **kw)
+    """subprocess.run with a timeout (0 or None means no limit) that kills the whole process tree when it expires.
+
+    subprocess.run only kills the direct child, and then waits for the pipes to close: a grandchild that still holds
+    them keeps the call blocked far past the timeout (measured: a 3 s timeout returned after 25 s).
+    """
+    proc = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                            errors="replace", start_new_session=(os.name != "nt"))
+    try:
+        out, err = proc.communicate(stdin_text, timeout=timeout or None)
+    except subprocess.TimeoutExpired:
+        kill_tree(proc)
+        try:
+            proc.communicate(timeout=10)  # drain the pipes; the TimeoutExpired below is what the caller sees either way
+        except subprocess.TimeoutExpired:
+            pass
+        raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
 
 
-def parse_codex(out):
-    text, tokens, done = "", 0, False
+def json_objects(out):
+    """The lines of `out` that are JSON objects; everything else (log noise, other JSON values) is skipped."""
     for line in out.splitlines():
         try:
             ev = json.loads(line)
         except ValueError:
             continue
-        if ev.get("type") == "item.completed" and ev.get("item", {}).get("type") == "agent_message":
-            text = ev["item"].get("text", "")
+        if isinstance(ev, dict):
+            yield ev
+
+
+def obj(value):
+    """value if it is a JSON object, else {}: fields of external data are not guaranteed to be objects."""
+    return value if isinstance(value, dict) else {}
+
+
+def parse_codex(out):
+    text, tokens, done = "", 0, False
+    for ev in json_objects(out):
+        item = obj(ev.get("item"))
+        if ev.get("type") == "item.completed" and item.get("type") == "agent_message":
+            text = item.get("text") or ""
         elif ev.get("type") == "turn.completed":
             done = True
-            u = ev.get("usage", {})
-            tokens = u.get("input_tokens", 0) + u.get("output_tokens", 0)
+            u = obj(ev.get("usage"))
+            tokens = (u.get("input_tokens") or 0) + (u.get("output_tokens") or 0)
     return done and bool(text), text, tokens
 
 
@@ -96,9 +146,13 @@ def run_codex(prompt, cwd, write, o, timeout):
     exe = find_exe("codex")
     if not exe:
         return Result(False, err="codex not installed")
-    # Do not add --ignore-user-config: it drops [windows] sandbox from config.toml and Codex then cannot run any command
-    cmd = [exe, "exec", "--skip-git-repo-check", "--ephemeral", "--json",
+    # Your config.toml would start your MCP servers and `notify` command inside a delegated run, so it is ignored. That
+    # also drops [windows] sandbox, without which Codex cannot run any command, so that one setting is passed back.
+    cmd = [exe, "exec", "--skip-git-repo-check", "--ephemeral", "--json", "--ignore-user-config", "--ignore-rules",
            "-s", "workspace-write" if write else "read-only", "-C", str(cwd)]
+    sandbox = codex_windows_sandbox()
+    if sandbox:
+        cmd += ["-c", f'windows.sandbox="{sandbox}"']
     if o.get("model"):
         cmd += ["-m", o["model"]]
     if o.get("effort"):
@@ -113,26 +167,19 @@ def run_codex(prompt, cwd, write, o, timeout):
 def codex_errors(out):
     """Readable error messages from the JSONL stream; the raw stream if none are found."""
     msgs = []
-    for line in out.splitlines():
-        try:
-            ev = json.loads(line)
-        except ValueError:
-            continue
-        msg = ev.get("message") or ev.get("error", {}).get("message") or (
-            ev["item"].get("message") if ev.get("item", {}).get("type") == "error" else None)
+    for ev in json_objects(out):
+        item = obj(ev.get("item"))
+        err = ev.get("error")
+        msg = ev.get("message") or obj(err).get("message") or (err if isinstance(err, str) else None) or (
+            item.get("message") if item.get("type") == "error" else None)
         if msg:
-            msgs.append(msg)
+            msgs.append(str(msg))
     return "\n".join(msgs) or out
 
 
 def parse_agy(out):
-    for line in reversed(out.splitlines()):
-        if line.startswith("{"):
-            try:
-                return json.loads(line)
-            except ValueError:
-                break
-    return None
+    """The last line of `out` that is a JSON object (agy prints its result as one), or None."""
+    return next(iter(reversed(list(json_objects(out)))), None)
 
 
 def run_agy(prompt, cwd, write, o, timeout):
@@ -149,15 +196,19 @@ def run_agy(prompt, cwd, write, o, timeout):
         cmd += ["--model", o["model"]]
     if o.get("effort"):
         cmd += ["--effort", o["effort"]]
+    if os.name == "nt" and len(subprocess.list2cmdline(cmd)) > MAX_WINDOWS_CMDLINE:
+        # quoting can grow the command line well past the prompt length (every " becomes \")
+        return Result(False, err="prompt is too long for a Windows command line after quoting; put the context in files")
     for _ in range(2):
         p = _run(cmd, cwd, timeout)
-        data = parse_agy(p.stdout)
-        success = bool(data) and data.get("status") == "SUCCESS" and p.returncode == 0
-        if success and data.get("response", "").strip():
-            return Result(True, data["response"], data.get("usage", {}).get("total_tokens", 0))
-        if not success:
+        data = parse_agy(p.stdout) or {}
+        success = data.get("status") == "SUCCESS" and p.returncode == 0
+        if success and str(data.get("response") or "").strip():
+            return Result(True, data["response"], obj(data.get("usage")).get("total_tokens") or 0)
+        if not success or (data.get("duration_seconds") or 0) > EMPTY_RETRY_MAX_SECONDS:
             break
-        # agy often reports SUCCESS with an empty response (roughly one run in three); once more is cheaper than failing over
+        # agy sometimes reports SUCCESS with an empty response (usually after a shell command it tried was denied).
+        # A quick one is worth one more try; one that took minutes is not worth paying for twice.
     return Result(False, err=f"exit {p.returncode}\n{p.stdout}\n{p.stderr}")
 
 
@@ -168,15 +219,34 @@ def codex_home():
     return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
 
 
+def codex_windows_sandbox():
+    """The `[windows] sandbox` value from Codex's config.toml (e.g. "elevated"), or None (also off Windows)."""
+    if os.name != "nt":
+        return None
+    try:
+        with open(codex_home() / "config.toml", "rb") as f:
+            value = obj(tomllib.load(f).get("windows")).get("sandbox")
+    except FileNotFoundError:
+        return None
+    except tomllib.TOMLDecodeError as e:
+        print(f"[delegate] codex config.toml is not valid TOML, windows.sandbox not passed on: {e}", file=sys.stderr)
+        return None
+    if value is not None and not re.fullmatch(r"[a-z_]+", str(value)):
+        print(f"[delegate] unexpected windows.sandbox value {value!r} in codex config.toml, not passed on", file=sys.stderr)
+        return None
+    return value
+
+
 def codex_models(include_hidden=False):
     """Models from Codex's own cache (efforts differ per model). [] when the cache is missing or unreadable."""
     try:
         data = json.loads((codex_home() / "models_cache.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return []
+    models = [m for m in obj(data).get("models") or [] if isinstance(m, dict) and m.get("slug")]
     return [{"model": m["slug"], "default_effort": m.get("default_reasoning_level"),
-             "efforts": [e["effort"] for e in m.get("supported_reasoning_levels", [])]}
-            for m in data.get("models", []) if include_hidden or m.get("visibility") == "list"]
+             "efforts": [e["effort"] for e in m.get("supported_reasoning_levels") or [] if "effort" in obj(e)]}
+            for m in models if include_hidden or m.get("visibility") == "list"]
 
 
 def agy_models():
@@ -237,10 +307,18 @@ def build_options(names, models, efforts):
 
 
 def load_state():
+    """The saved state; empty when there is none. A damaged file is reported and replaced by an empty state on the next save."""
     try:
-        return json.loads(STATE.read_text(encoding="utf-8"))
+        st = json.loads(STATE.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return {}
+    except ValueError as e:
+        print(f"[delegate] {STATE} is not valid JSON, starting with empty state: {e}", file=sys.stderr)
+        return {}
+    if not isinstance(st, dict):
+        print(f"[delegate] {STATE} does not hold a JSON object, starting with empty state", file=sys.stderr)
+        return {}
+    return st
 
 
 def save_state(st):
@@ -260,7 +338,8 @@ def delegate(prompt, providers, cwd, write=False, opts=None, timeout=600, cooldo
     st = load_state()
     quota_blocked, failed = 0, 0
     for name in providers:
-        p = st.setdefault(name, {"history": []})
+        p = st.setdefault(name, {})
+        p.setdefault("history", [])
         if p.get("blocked_until", 0) > now():
             print(f"[delegate] {name}: skipped, out of quota until {time.strftime('%H:%M', time.localtime(p['blocked_until']))}",
                   file=sys.stderr)
@@ -270,6 +349,8 @@ def delegate(prompt, providers, cwd, write=False, opts=None, timeout=600, cooldo
             res = RUNNERS[name](prompt, cwd, write, opts.get(name, {}), timeout)
         except subprocess.TimeoutExpired:
             res = Result(False, err=f"timeout after {timeout}s")
+        except OSError as e:  # the provider could not even be started (bad --cwd, executable unusable): try the next one
+            res = Result(False, err=f"could not start {name}: {e}")
         if res.ok:
             p["history"] = (p["history"] + [[now(), res.tokens]])[-HISTORY_CAP:]
             p.pop("blocked_until", None)
@@ -324,7 +405,7 @@ def cmd_models(args):
     if args.json:
         print(json.dumps({"codex": {"models": cx}, "agy": {"efforts": list(AGY_EFFORTS), "models": ag}}, indent=1))
         return 0
-    print("codex  without --model/--effort the values from your config.toml apply")
+    print("codex  runs without your config.toml: pass --model; without --effort the model's own default applies")
     for m in cx:
         print(f"  {m['model']:16} model default effort {m['default_effort']}; efforts: {', '.join(m['efforts'])}")
     if not cx:
@@ -380,7 +461,8 @@ def providers_and_options(args):
     names = [n.strip() for n in args.providers.split(",") if n.strip()]
     unknown = [n for n in names if n not in RUNNERS]
     if unknown or not names:
-        sys.exit(f"unknown provider(s): {unknown or 'none given'}; known: {', '.join(RUNNERS)}")
+        print(f"[delegate] unknown provider(s): {unknown or 'none given'}; known: {', '.join(RUNNERS)}", file=sys.stderr)
+        return names, None
     try:
         return names, build_options(names, args.model, args.effort)
     except ValueError as e:
@@ -399,6 +481,13 @@ def cmd_run(args):
     return code
 
 
+def seconds(value):
+    n = int(value)
+    if n < 0:
+        raise argparse.ArgumentTypeError("must be 0 (no limit) or a positive number of seconds")
+    return n
+
+
 def main(argv=None):
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
@@ -411,7 +500,8 @@ def main(argv=None):
     r.add_argument("--write", action="store_true", help="allow edits in cwd (default is read-only)")
     r.add_argument("--model", action="append", metavar="[PROVIDER=]MODEL")
     r.add_argument("--effort", action="append", metavar="[PROVIDER=]LEVEL", help="reasoning effort, see `models`")
-    r.add_argument("--timeout", type=int, default=600)
+    r.add_argument("--timeout", type=seconds, default=600, metavar="SECONDS",
+                   help="give up on a provider after this long and try the next; 0 means no limit (default 600)")
     r.add_argument("--cooldown", type=int, default=DEFAULT_COOLDOWN, help="seconds to block a provider when no reset time is given")
     r.set_defaults(fn=cmd_run)
     m = sub.add_parser("models", help="list the models and efforts each provider accepts")
@@ -421,7 +511,7 @@ def main(argv=None):
     c.add_argument("--providers", default="agy,codex")
     c.add_argument("--model", action="append", metavar="[PROVIDER=]MODEL")
     c.add_argument("--effort", action="append", metavar="[PROVIDER=]LEVEL")
-    c.add_argument("--timeout", type=int, default=300)
+    c.add_argument("--timeout", type=seconds, default=300, metavar="SECONDS", help="0 means no limit (default 300)")
     c.set_defaults(fn=cmd_check)
     s = sub.add_parser("status")
     s.add_argument("--json", action="store_true")
