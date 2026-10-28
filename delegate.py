@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Hand a prompt to Codex or Antigravity (agy) and fall back when a subscription runs out.
+"""Hand a prompt to Hermes, Antigravity (agy) or Codex and fall back when a subscription runs out.
 
-    delegate.py run [--providers agy,codex] [--cwd DIR] [--write] [--model [P=]M] [--effort [P=]E] PROMPT|-
+    delegate.py run [--providers hermes,agy,codex] [--cwd DIR] [--write] [--model [P=]M] [--effort [P=]E] PROMPT|-
     delegate.py models [--json]
-    delegate.py check [--providers agy,codex] [--model [P=]M] [--effort [P=]E]
+    delegate.py check [--providers hermes,agy,codex] [--model [P=]M] [--effort [P=]E]
     delegate.py status [--json]
     delegate.py reset [PROVIDER]
 
@@ -12,7 +12,11 @@
 `models` lists what each provider accepts. Codex runs with --ignore-user-config and --ignore-rules, so your MCP
 servers, `notify` command and rules do not apply and Codex's own default model is used unless you pass --model. The
 one setting passed back is `[windows] sandbox` (without it Codex cannot run commands on Windows).
-`check` runs a real read-the-file test on each provider; run it after changing flags, models or either CLI.
+`check` runs a real read-the-file test on each provider; run it after changing flags, models or any of the CLIs.
+
+Hermes (`hermes -z`, ChatGPT login via `hermes auth add openai-codex --type oauth`) has no read-only mode and its
+one-shot runs bypass approvals, so it is only run with file tools and --safe-mode, inside a throwaway copy of --cwd
+that is deleted afterwards. It cannot be used with --write, and file names in its answer refer to that copy.
 
 `--timeout SECONDS` (default 600; 0 = no limit) is per provider; when it expires the provider's whole process tree is
 killed and the next provider is tried. For tasks that run longer than your shell tool allows in the foreground,
@@ -25,12 +29,14 @@ import argparse
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import time
 import tomllib
+from datetime import datetime
 from pathlib import Path
 
 STATE = Path(os.environ.get("LLM_DELEGATE_STATE")
@@ -43,9 +49,26 @@ EMPTY_RETRY_MAX_SECONDS = 60  # an empty agy answer is retried once only if the 
 # shortcut: patterns are guesses from public reports, not captured from a real exhausted account; extend on first real miss
 QUOTA_RE = re.compile(r"usage limit|rate.?limit|quota|resource.?exhausted|\b429\b|too many requests"
                       r"|exceeded your|out of credits", re.I)
-RETRY_RE = re.compile(r"(?:try again|retry|resets?)\s+(?:in|after)\s+((?:\d+\s*[dhms]\w*[\s,]*(?:and\s+)?)+)", re.I)
-UNIT = {"d": 86400, "h": 3600, "m": 60, "s": 1}
+# A number followed by a whole time word: "3h", "20 min", "500 milliseconds". "5 messages" must not read as minutes.
+TIME = r"(\d+(?:\.\d+)?)\s*(ms|milliseconds?|days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b"
+RETRY_RE = re.compile(rf"(?:try again|retry|resets?)\s+(?:in|after)\s+((?:{TIME}[\s,]*(?:and\s+)?)+)", re.I)
+UNIT_SECONDS = {"ms": 0.001, "d": 86400, "h": 3600, "m": 60, "s": 1}
 AGY_EFFORTS = ("low", "medium", "high", "xhigh", "max")  # from `agy --help`; per-model support is not published
+HERMES_PROVIDER = "openai-codex"  # the ChatGPT login added with `hermes auth add openai-codex --type oauth`
+HERMES_DEFAULT_MODEL = "gpt-6.1-sol"  # --safe-mode ignores Hermes's config, so a model must always be passed
+HERMES_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")  # from `hermes --help`
+# Nous Portal free tier: models whose id ends in :free. Not a default provider, because the vendor says inputs may be used
+# for training unless Privacy Mode is on. Of the seven free models tried, `reflection/beam-1.0-501b-a23b:free` gave the
+# best review for its time (46 s, three real findings of five), so it is the default.
+NOUS_PROVIDER = "nous"
+NOUS_DEFAULT_MODEL = "reflection/beam-1.0-501b-a23b:free"
+# `hermes usage` reports the usage windows of the ChatGPT subscription that both of these providers spend.
+CHATGPT_PROVIDERS = ("hermes", "codex")
+DEFAULT_STOP_AT = 95  # percent of a usage window at or above which the ChatGPT providers are skipped until it resets
+# Hermes runs on a copy of --cwd. shortcut: these names are skipped and a size cap stands in for the rest; raise the cap
+# or point --cwd at a smaller directory if a real project does not fit.
+HERMES_COPY_IGNORE = (".git", "node_modules", "__pycache__", ".venv", "venv")
+HERMES_MAX_COPY_BYTES = 200 * 2**20
 # In --mode plan agy often answers with "I prepared a plan, please approve it" instead of the answer. And when it tries
 # to run a shell command nobody can approve it, the permission is denied and the turn ends with an empty response
 # (seen in agy's conversation database: "user denied permission to run command"). This steers it away from both.
@@ -64,8 +87,13 @@ def parse_cooldown(text):
     m = RETRY_RE.search(text)
     if not m:
         return None
-    total = sum(int(n) * UNIT[u.lower()] for n, u in re.findall(r"(\d+)\s*([dhms])", m.group(1), re.I))
-    return max(total, 60) or None
+    total = sum(float(n) * unit_seconds(u) for n, u in re.findall(TIME, m.group(1), re.I))
+    return max(int(total), 60)
+
+
+def unit_seconds(word):
+    w = word.lower()
+    return UNIT_SECONDS["ms"] if w == "ms" or w.startswith("milli") else UNIT_SECONDS[w[0]]
 
 
 def find_exe(name):
@@ -81,6 +109,18 @@ def find_exe(name):
         if cand.is_file() and (os.name == "nt" or os.access(cand, os.X_OK)):
             return str(cand)
     return None
+
+
+def cmdline_units(cmd):
+    """Length of the Windows command line for cmd in UTF-16 code units, which is what CreateProcess limits.
+
+    Quoting can grow it well past the prompt length (every " becomes \\") and a character outside the Basic
+    Multilingual Plane, such as an emoji, takes two units.
+    """
+    return len(subprocess.list2cmdline(cmd).encode("utf-16-le")) // 2
+
+
+CMDLINE_TOO_LONG = "prompt is too long for a Windows command line after quoting; put the context in files"
 
 
 def kill_tree(proc):
@@ -196,9 +236,8 @@ def run_agy(prompt, cwd, write, o, timeout):
         cmd += ["--model", o["model"]]
     if o.get("effort"):
         cmd += ["--effort", o["effort"]]
-    if os.name == "nt" and len(subprocess.list2cmdline(cmd)) > MAX_WINDOWS_CMDLINE:
-        # quoting can grow the command line well past the prompt length (every " becomes \")
-        return Result(False, err="prompt is too long for a Windows command line after quoting; put the context in files")
+    if os.name == "nt" and cmdline_units(cmd) > MAX_WINDOWS_CMDLINE:
+        return Result(False, err=CMDLINE_TOO_LONG)
     for _ in range(2):
         p = _run(cmd, cwd, timeout)
         data = parse_agy(p.stdout) or {}
@@ -212,7 +251,65 @@ def run_agy(prompt, cwd, write, o, timeout):
     return Result(False, err=f"exit {p.returncode}\n{p.stdout}\n{p.stderr}")
 
 
-RUNNERS = {"codex": run_codex, "agy": run_agy}
+def copy_workdir(src, dst):
+    """Copy src to dst. Hermes cannot be made read-only, so it works on a throwaway copy. ValueError if src is too big."""
+    total = 0
+    for root, dirs, files in os.walk(src):
+        dirs[:] = [d for d in dirs if d not in HERMES_COPY_IGNORE]
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_size
+            except FileNotFoundError:  # a broken link or a file that vanished while walking
+                continue
+            if total > HERMES_MAX_COPY_BYTES:
+                raise ValueError(f"{src} is over {HERMES_MAX_COPY_BYTES // 2**20} MB; point --cwd at a smaller directory")
+    shutil.copytree(src, dst, ignore=shutil.ignore_patterns(*HERMES_COPY_IGNORE), symlinks=True)
+
+
+def run_hermes_as(provider, default_model, prompt, cwd, write, o, timeout):
+    exe = find_exe("hermes")
+    if not exe:
+        return Result(False, err="hermes not installed")
+    if write:
+        return Result(False, err="hermes has no read-only or sandbox mode, so it only works on a throwaway copy; "
+                                 "use codex for --write")
+    if len(prompt) > MAX_ARG_PROMPT:
+        return Result(False, err=f"prompt is {len(prompt)} chars; put the context in files and refer to their paths")
+    cmd = [exe, "-z", prompt, "--provider", provider, "-m", o.get("model") or default_model,
+           "-t", "file", "--safe-mode"]  # file tools only (no terminal); --safe-mode ignores config, memory, plugins, MCP
+    if o.get("effort"):
+        cmd += ["--reasoning", o["effort"]]
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        work, usage_file = Path(tmp) / "work", Path(tmp) / "usage.json"
+        try:
+            copy_workdir(cwd, work)
+        except (ValueError, OSError, shutil.Error) as e:
+            return Result(False, err=f"cannot make a throwaway copy of {cwd}: {e}")
+        cmd += ["--usage-file", str(usage_file)]
+        if os.name == "nt" and cmdline_units(cmd) > MAX_WINDOWS_CMDLINE:
+            return Result(False, err=CMDLINE_TOO_LONG)
+        p = _run(cmd, work, timeout)
+        try:
+            usage = obj(json.loads(usage_file.read_text(encoding="utf-8")))
+        except (OSError, ValueError):  # not written when Hermes could not even start
+            usage = {}
+    text = p.stdout.strip()
+    if p.returncode == 0 and text and not usage.get("failed") and usage.get("completed", True):
+        return Result(True, text, usage.get("total_tokens") or 0)
+    return Result(False, err=f"exit {p.returncode}\n{p.stdout}\n{p.stderr}")
+
+
+def run_hermes(prompt, cwd, write, o, timeout):
+    """Hermes on the ChatGPT subscription (the same one Codex CLI uses)."""
+    return run_hermes_as(HERMES_PROVIDER, HERMES_DEFAULT_MODEL, prompt, cwd, write, o, timeout)
+
+
+def run_nous(prompt, cwd, write, o, timeout):
+    """Hermes on the Nous Portal free tier. Opt-in only: see the data-use warning in the README."""
+    return run_hermes_as(NOUS_PROVIDER, NOUS_DEFAULT_MODEL, prompt, cwd, write, o, timeout)
+
+
+RUNNERS = {"hermes": run_hermes, "codex": run_codex, "agy": run_agy, "nous": run_nous}
 
 
 def codex_home():
@@ -267,6 +364,10 @@ def check_options(name, o):
     model, effort = o.get("model"), o.get("effort")
     if name == "agy" and effort and effort not in AGY_EFFORTS:
         return f"agy effort {effort!r} is not one of {', '.join(AGY_EFFORTS)}"
+    if name in ("hermes", "nous") and effort and effort not in HERMES_EFFORTS:
+        return f"{name} effort {effort!r} is not one of {', '.join(HERMES_EFFORTS)}"
+    if name == "nous" and model and not model.endswith(":free"):
+        return f"nous is for the free tier only: {model!r} does not end in :free, so it could spend paid credits"
     if name == "codex" and (model or effort):
         known = {m["model"]: m for m in codex_models(include_hidden=True)}
         if model and known and model not in known:
@@ -306,6 +407,52 @@ def build_options(names, models, efforts):
     return opts
 
 
+class LimitsUnavailable(Exception):
+    pass
+
+
+def hermes_limits(provider, timeout=30):
+    """Usage windows that `hermes usage` reports for a provider ("openai-codex" for the ChatGPT subscription, "anthropic").
+
+    Returns {"plan": ..., "windows": [{"label", "used_percent", "resets_at" (epoch seconds)}]}.
+    Raises LimitsUnavailable with the reason when they cannot be read.
+    """
+    exe = find_exe("hermes")
+    if not exe:
+        raise LimitsUnavailable("hermes not installed")
+    try:
+        p = _run([exe, "usage", "--provider", provider, "--json"], None, timeout)
+    except subprocess.TimeoutExpired:
+        raise LimitsUnavailable(f"hermes usage timed out after {timeout}s")
+    if p.returncode != 0:
+        raise LimitsUnavailable((p.stderr or p.stdout).strip()[:150] or f"hermes usage exited with {p.returncode}")
+    try:
+        data = obj(json.loads(p.stdout))
+    except ValueError as e:
+        raise LimitsUnavailable(f"hermes usage did not print JSON: {e}")
+    if data.get("unavailable_reason"):
+        raise LimitsUnavailable(str(data["unavailable_reason"]))
+    windows = []
+    for w in data.get("windows") or []:
+        w = obj(w)
+        try:
+            resets = datetime.fromisoformat(w["resets_at"]).timestamp()
+            pct = float(w["used_percent"])
+        except (KeyError, TypeError, ValueError):
+            continue  # a window without a usable reset time or percentage tells us nothing
+        windows.append({"label": str(w.get("label") or "window"), "used_percent": pct, "resets_at": resets})
+    return {"plan": data.get("plan"), "windows": windows}
+
+
+def limit_block(limits, stop_at):
+    """(resets_at, label, used_percent) of the window that blocks use for longest, if any is at or over stop_at."""
+    over = [w for w in limits["windows"] if w["used_percent"] >= stop_at]
+    if not over:
+        return None
+    w = max(over, key=lambda w: w["resets_at"])
+    return w["resets_at"], w["label"], w["used_percent"]
+
+
 def load_state():
     """The saved state; empty when there is none. A damaged file is reported and replaced by an empty state on the next save."""
     try:
@@ -329,22 +476,39 @@ def save_state(st):
     os.replace(tmp, STATE)
 
 
-def delegate(prompt, providers, cwd, write=False, opts=None, timeout=600, cooldown=DEFAULT_COOLDOWN, now=time.time):
+def delegate(prompt, providers, cwd, write=False, opts=None, timeout=600, cooldown=DEFAULT_COOLDOWN, now=time.time,
+             stop_at=DEFAULT_STOP_AT, limits_fn=None):
     """Returns (exit_code, text). Tries providers in order, skipping and recording exhausted ones.
 
-    opts maps provider -> {"model", "effort"}.
+    opts maps provider -> {"model", "effort"}. When stop_at is non-zero and a ChatGPT provider is about to be tried, the
+    subscription's usage windows are read once (limits_fn) and the provider is skipped, without spending a call, while
+    any window is at or above stop_at percent.
     """
     opts = opts or {}
+    limits_fn = limits_fn or hermes_limits
     st = load_state()
     quota_blocked, failed = 0, 0
+    chatgpt_block, chatgpt_checked = None, False
     for name in providers:
         p = st.setdefault(name, {})
         p.setdefault("history", [])
+        if stop_at and name in CHATGPT_PROVIDERS and not chatgpt_checked:
+            chatgpt_checked = True
+            try:
+                chatgpt_block = limit_block(limits_fn("openai-codex"), stop_at)
+            except LimitsUnavailable as e:
+                print(f"[delegate] ChatGPT usage limits not checked: {e}", file=sys.stderr)
+        if name in CHATGPT_PROVIDERS and chatgpt_block and chatgpt_block[0] > now():
+            until, label, pct = chatgpt_block
+            p["blocked_until"] = max(p.get("blocked_until", 0), until)
+            p["block_reason"] = f"ChatGPT {label} window {pct:.0f}% used"
         if p.get("blocked_until", 0) > now():
-            print(f"[delegate] {name}: skipped, out of quota until {time.strftime('%H:%M', time.localtime(p['blocked_until']))}",
-                  file=sys.stderr)
+            reason = f" ({p['block_reason']})" if p.get("block_reason") else ""
+            print(f"[delegate] {name}: skipped, out of quota until "
+                  f"{time.strftime('%H:%M', time.localtime(p['blocked_until']))}{reason}", file=sys.stderr)
             quota_blocked += 1
             continue
+        p.pop("block_reason", None)  # a mark that has expired no longer has a reason
         try:
             res = RUNNERS[name](prompt, cwd, write, opts.get(name, {}), timeout)
         except subprocess.TimeoutExpired:
@@ -387,24 +551,58 @@ def describe(st, name, now=None):
             "tokens_24h": window(86400)[1], "last_error": p.get("last_error")}
 
 
+LIMIT_SOURCES = (("chatgpt", "openai-codex"), ("anthropic", "anthropic"))  # label, `hermes usage --provider` value
+
+
+def subscription_limits():
+    """{label: limits dict, or {"unavailable": reason}} for each subscription `hermes usage` can report on."""
+    out = {}
+    for label, provider in LIMIT_SOURCES:
+        try:
+            out[label] = hermes_limits(provider)
+        except LimitsUnavailable as e:
+            out[label] = {"unavailable": str(e)}
+    return out
+
+
+def format_limits(label, limits):
+    if "unavailable" in limits:
+        return f"{label}: unavailable ({limits['unavailable']})"
+    parts = [f"{w['label']} {w['used_percent']:.0f}% used, resets {time.strftime('%d.%m %H:%M', time.localtime(w['resets_at']))}"
+             for w in limits["windows"]]
+    return f"{label}{' (' + limits['plan'] + ')' if limits.get('plan') else ''}: " + ("; ".join(parts) or "no usage windows reported")
+
+
 def cmd_status(args):
     st = load_state()
     rows = [describe(st, n) for n in RUNNERS]
+    limits = subscription_limits() if args.limits else {}
     if args.json:
-        print(json.dumps(rows, indent=1))
+        print(json.dumps({"providers": rows, "limits": limits}, indent=1))
         return 0
     for r in rows:
         state = "available" if r["available"] else "OUT OF QUOTA until " + time.strftime("%H:%M", time.localtime(r["blocked_until"]))
-        print(f"{r['provider']:6} {state} | calls 5h/24h/7d {r['calls_5h']}/{r['calls_24h']}/{r['calls_7d']}"
+        print(f"{r['provider']:7} {state} | calls 5h/24h/7d {r['calls_5h']}/{r['calls_24h']}/{r['calls_7d']}"
               f" | tokens 24h {r['tokens_24h']}" + (f" | last error: {r['last_error'][:80]}" if r["last_error"] else ""))
+    if limits:
+        print("subscription limits (hermes usage; hermes and codex share the chatgpt one):")
+        for label, lim in limits.items():
+            print("  " + format_limits(label, lim))
     return 0
 
 
 def cmd_models(args):
     cx, ag = codex_models(), agy_models()
+    hermes = {"provider": HERMES_PROVIDER, "default_model": HERMES_DEFAULT_MODEL, "efforts": list(HERMES_EFFORTS)}
+    nous = {"provider": NOUS_PROVIDER, "default_model": NOUS_DEFAULT_MODEL, "efforts": list(HERMES_EFFORTS)}
     if args.json:
-        print(json.dumps({"codex": {"models": cx}, "agy": {"efforts": list(AGY_EFFORTS), "models": ag}}, indent=1))
+        print(json.dumps({"hermes": hermes, "nous": nous, "codex": {"models": cx},
+                          "agy": {"efforts": list(AGY_EFFORTS), "models": ag}}, indent=1))
         return 0
+    print(f"nous   Hermes on the Nous Portal free tier, opt-in (inputs may be used for training); default model "
+          f"{NOUS_DEFAULT_MODEL}; only ids ending in :free are accepted; the free list changes, see the Nous Portal")
+    print(f"hermes provider {HERMES_PROVIDER} (ChatGPT login); default model {HERMES_DEFAULT_MODEL}, other ids as in the"
+          f" codex list below are passed through; --effort: {', '.join(HERMES_EFFORTS)}; read-only, on a throwaway copy of --cwd")
     print("codex  runs without your config.toml: pass --model; without --effort the model's own default applies")
     for m in cx:
         print(f"  {m['model']:16} model default effort {m['default_effort']}; efforts: {', '.join(m['efforts'])}")
@@ -421,7 +619,8 @@ def cmd_models(args):
 def cmd_reset(args):
     st = load_state()
     for n in ([args.provider] if args.provider else list(st)):
-        st.get(n, {}).pop("blocked_until", None)
+        for key in ("blocked_until", "block_reason"):  # a ChatGPT limit mark comes back at the next run if the window is still full
+            st.get(n, {}).pop(key, None)
     save_state(st)
     return 0
 
@@ -475,7 +674,8 @@ def cmd_run(args):
     if opts is None:
         return 2
     prompt = sys.stdin.read() if args.prompt == "-" else args.prompt
-    code, text = delegate(prompt, names, Path(args.cwd).resolve(), args.write, opts, args.timeout, args.cooldown)
+    code, text = delegate(prompt, names, Path(args.cwd).resolve(), args.write, opts, args.timeout, args.cooldown,
+                          stop_at=args.stop_at)
     if text:
         sys.stdout.write(text if text.endswith("\n") else text + "\n")
     return code
@@ -495,7 +695,7 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run")
     r.add_argument("prompt", help="prompt text, or - to read stdin")
-    r.add_argument("--providers", default="agy,codex", help="try in this order (default: agy,codex)")
+    r.add_argument("--providers", default="hermes,agy,codex", help="try in this order (default: hermes,agy,codex)")
     r.add_argument("--cwd", default=".")
     r.add_argument("--write", action="store_true", help="allow edits in cwd (default is read-only)")
     r.add_argument("--model", action="append", metavar="[PROVIDER=]MODEL")
@@ -503,18 +703,22 @@ def main(argv=None):
     r.add_argument("--timeout", type=seconds, default=600, metavar="SECONDS",
                    help="give up on a provider after this long and try the next; 0 means no limit (default 600)")
     r.add_argument("--cooldown", type=int, default=DEFAULT_COOLDOWN, help="seconds to block a provider when no reset time is given")
+    r.add_argument("--stop-at", type=int, default=DEFAULT_STOP_AT, metavar="PERCENT",
+                   help="skip the ChatGPT providers (hermes, codex) while a usage window of the subscription is at or "
+                        f"above this percent, read with `hermes usage` (default {DEFAULT_STOP_AT}; 0 = do not check)")
     r.set_defaults(fn=cmd_run)
     m = sub.add_parser("models", help="list the models and efforts each provider accepts")
     m.add_argument("--json", action="store_true")
     m.set_defaults(fn=cmd_models)
     c = sub.add_parser("check", help="make each provider read a test file; spends tokens on every provider")
-    c.add_argument("--providers", default="agy,codex")
+    c.add_argument("--providers", default="hermes,agy,codex", help="providers to test (default: hermes,agy,codex)")
     c.add_argument("--model", action="append", metavar="[PROVIDER=]MODEL")
     c.add_argument("--effort", action="append", metavar="[PROVIDER=]LEVEL")
     c.add_argument("--timeout", type=seconds, default=300, metavar="SECONDS", help="0 means no limit (default 300)")
     c.set_defaults(fn=cmd_check)
-    s = sub.add_parser("status")
+    s = sub.add_parser("status", help="calls, tokens, out-of-quota marks and subscription usage windows")
     s.add_argument("--json", action="store_true")
+    s.add_argument("--no-limits", dest="limits", action="store_false", help="skip `hermes usage` (saves about 6 seconds)")
     s.set_defaults(fn=cmd_status)
     z = sub.add_parser("reset", help="clear the out-of-quota mark")
     z.add_argument("provider", nargs="?")

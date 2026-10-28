@@ -1,48 +1,56 @@
 # llm-delegate
 
-A small command-line wrapper that hands a prompt to **Codex CLI** or **Antigravity CLI (`agy`)**, picks the model and
-reasoning effort, and moves on to the next provider when a subscription runs out of quota.
+A small command-line wrapper that hands a prompt to **Hermes Agent**, **Antigravity CLI (`agy`)** or **Codex CLI**,
+picks the model and reasoning effort, and moves on to the next provider when a subscription runs out of quota.
 
 It exists so a host coding agent (or a person) can offload bulky reading and mechanical work to the subscriptions
 already paid for, instead of spending the host's own tokens. One file, no dependencies, standard library only.
 
 ```
-$ python delegate.py run --providers agy,codex "Read src/ and summarise the module layout in 15 lines"
-[delegate] agy: ok, 29019 tokens
+$ python delegate.py run "Read src/ and summarise the module layout in 15 lines"
+[delegate] hermes: ok, 10305 tokens
 <the answer, and nothing else, on stdout>
 ```
 
 ## What it does
 
-- **Runs one prompt** through `agy` or `codex` in non-interactive mode and prints only the answer to stdout.
-  Diagnostics go to stderr, so the output can be piped or captured as is.
-- **Falls back.** Providers are tried in the order given. If one reports a usage limit, it is marked as exhausted
-  until the reset time (taken from the error text when present, otherwise one hour) and is skipped on later calls.
+- **Runs one prompt** through `hermes`, `agy` or `codex` in non-interactive mode and prints only the answer to
+  stdout. Diagnostics go to stderr, so the output can be piped or captured as is.
+- **Falls back.** Providers are tried in the order given (default `hermes,agy,codex`). If one reports a usage limit,
+  it is marked as exhausted until the reset time (taken from the error text when present, otherwise one hour) and is
+  skipped on later calls. Any other failure moves on to the next provider without a mark.
 - **Chooses model and effort** per provider (`--model`, `--effort`) and rejects combinations Codex is known not to
   support before spending a call.
 - **Keeps a usage ledger** (calls in the last 5 hours, 24 hours and 7 days, tokens in the last 24 hours) so a
   caller can look before sending a large batch.
-- **Is read-only by default.** Codex runs with `-s read-only`, `agy` with `--mode plan`. `--write` allows edits in
-  `--cwd`.
+- **Reads the ChatGPT subscription's usage windows** (`hermes usage`) and skips `hermes` and `codex`, without
+  spending a call, while a window is at or above 95 percent. `status` shows them next to the ledger.
+- **Can use the Nous Portal free tier** through Hermes (`nous`), opt-in because of its data-use terms.
+- **Is read-only by default.** Codex runs with `-s read-only`, `agy` with `--mode plan`, and Hermes, which has no
+  read-only mode, only on a throwaway copy of `--cwd` (see Hermes below). `--write` allows edits in `--cwd` for
+  `codex` and `agy`; `hermes` refuses it.
 
 ## Requirements
 
 - Python 3.11 or newer (`tomllib`). Developed and tested on 3.14 on Windows 11; other versions and other systems are
   untested.
-- `codex` and/or `agy` installed, on `PATH` and already signed in. This tool does not log in for you.
+- `hermes`, `codex` and/or `agy` installed, on `PATH` and already signed in. This tool does not log in for you.
+  Hermes is used through its ChatGPT login: `hermes auth add openai-codex --type oauth`. The free tier needs the Nous
+  Portal login (`hermes auth upgrade` or `hermes portal`).
 
 ## Usage
 
 ```
-delegate.py run [--providers agy,codex] [--model [P=]M] [--effort [P=]E] [--cwd DIR] [--write]
-                [--timeout SECONDS] [--cooldown SECONDS] PROMPT|-
+delegate.py run [--providers hermes,agy,codex] [--model [P=]M] [--effort [P=]E] [--cwd DIR] [--write]
+                [--timeout SECONDS] [--cooldown SECONDS] [--stop-at PERCENT] PROMPT|-
 delegate.py models [--json]
-delegate.py check [--providers agy,codex] [--model [P=]M] [--effort [P=]E]
-delegate.py status [--json]
+delegate.py check [--providers hermes,agy,codex] [--model [P=]M] [--effort [P=]E]
+delegate.py status [--json] [--no-limits]
 delegate.py reset [PROVIDER]
 ```
 
-`PROMPT` may be `-` to read it from stdin.
+`PROMPT` may be `-` to read it from stdin. `hermes` and `agy` receive it as a command-line argument, so very long
+prompts are refused (see Safety notes).
 
 ### Model and effort
 
@@ -62,10 +70,29 @@ one from that file. Pass `--model`. Those flags also drop `[windows] sandbox`, w
 run any command and answers that it can't read files. The tool therefore reads that one value from your `config.toml`
 and passes it back with `-c windows.sandbox=...`.
 
+### Hermes
+
+[Hermes Agent](https://github.com/nousresearch/hermes-agent) is a full agent, not a plain CLI. Its one-shot mode
+(`hermes -z`) bypasses approvals and it has no read-only mode: the smallest toolset that reads files, `file`, also
+writes them. The tool therefore runs it with `-t file` (no terminal) and `--safe-mode` (no config, memory, plugins or
+MCP servers), and only inside a throwaway copy of `--cwd` that is deleted afterwards. Consequences:
+
+- `--write` is refused for Hermes (use `codex` or `agy`). File names in its answer refer to the copy.
+- The copy skips `.git`, `node_modules`, `__pycache__`, `.venv` and `venv`, and is refused above 200 MB. Point `--cwd`
+  at a smaller directory if a project does not fit.
+- `--safe-mode` ignores Hermes's own config, so a model is always passed: `gpt-6.1-sol` unless you give `--model`.
+  The provider is fixed to `openai-codex` (the ChatGPT login), the same subscription Codex CLI uses.
+- Hermes does not read the prompt from stdin (`-z -` is taken as the text `-`), so the prompt is an argument.
+
+Measured on one machine with `gpt-6.1-sol`: reading a one-line file took 7 400 tokens and 15 seconds (Codex CLI:
+30 000 to 38 000), and a review of a 437-line file 14 500 tokens and 30 seconds (Codex CLI: 154 000 tokens, 40
+seconds), with findings at least as good, all confirmed by hand. One task, one run per setting; Hermes was given only
+file tools while Codex CLI could run commands to reproduce what it found, which explains part of the gap.
+
 ### Check
 
 ```
-python delegate.py check [--providers agy,codex] [--model [P=]M] [--effort [P=]E]
+python delegate.py check [--providers hermes,agy,codex] [--model [P=]M] [--effort [P=]E]
 ```
 
 Asks each provider to read a file whose contents it can only learn by reading it, and prints `PASS` or `FAIL`.
@@ -77,10 +104,49 @@ has no way to tell that from a real answer, so this is the way to catch it.
 
 ```
 $ python delegate.py status
-codex  available | calls 5h/24h/7d 2/5/5 | tokens 24h 61207
-agy    OUT OF QUOTA until 19:48 | calls 5h/24h/7d 1/3/3 | tokens 24h 38120 | last error: ...
+hermes  available | calls 5h/24h/7d 1/1/1 | tokens 24h 11271
+codex   available | calls 5h/24h/7d 0/0/0 | tokens 24h 0
+agy     OUT OF QUOTA until 19:48 | calls 5h/24h/7d 1/3/3 | tokens 24h 38120 | last error: ...
+nous    available | calls 5h/24h/7d 0/0/0 | tokens 24h 0
+subscription limits (hermes usage; hermes and codex share the chatgpt one):
+  chatgpt (Plus): Session 7% used, resets 28.10 19:02; Weekly 1% used, resets 04.11 14:02
+  anthropic: Current session 0% used, resets 28.10 21:00; Current week 60% used, resets 01.11 04:00
 $ python delegate.py reset agy      # clear the mark if you know the quota is back
 ```
+
+### Subscription limits
+
+`hermes usage --provider openai-codex --json` returns the plan and the usage windows ("Session", about five hours, and
+"Weekly") of the ChatGPT subscription, which `hermes` and `codex` both spend. Before the first of them is tried, `run`
+reads it once (about 3 seconds) and skips both while any window is at or above `--stop-at` percent (default 95, `0`
+turns the check off); the mark lasts until that window resets and says why. If the windows cannot be read, a line on
+stderr says so and the call goes ahead. `status` also shows them, plus the `anthropic` windows Hermes can read with
+its own login (informational, it is not a provider here), and skips the lookup with `--no-limits`.
+`hermes usage` has no figures for the Google subscription behind `agy` or for the Nous free tier, so those are still
+learned only from a failed call.
+
+### Free tier (`nous`)
+
+Hermes can use the free models of the [Nous Portal](https://portal.nousresearch.com/) (ids ending in `:free`). The
+provider `nous` runs them the same way as `hermes`: file tools only, `--safe-mode`, a throwaway copy of `--cwd`. It is
+never in the default order and refuses a model that does not end in `:free`, so it cannot spend paid credits.
+
+**Data use: according to a third-party summary of the vendor's terms, inputs to the free tier may be used for training
+or product improvement unless Privacy Mode is on.** Do not send private, proprietary or sensitive code or documents
+through `nous`; check the current terms and the Privacy Mode setting on the portal first. The vendor publishes no rate
+limit or quota figures for the free tier.
+
+Tried on one account on 2026-10-28 (the model list changes; `longcat-2.0:free` was not available on it):
+
+| Model | Read a one-line file | Review of a 437-line file (five findings asked for) |
+|-------|----------------------|------------------------------------------------------|
+| `reflection/beam-1.0-501b-a23b:free` (default) | 11 s, 5 600 tokens | 46 s, 19 700 tokens: 3 real findings, 2 doubtful |
+| `stepfun/step-3.7-flash:free` | 29 s, 6 700 tokens | 279 s, 30 500 tokens: 5 plausible findings |
+| `poolside/laguna-xs-2.1:free` | 13 s, 6 300 tokens | 14 s, 13 600 tokens: 2 findings, neither a real bug |
+| `poolside/laguna-s-2.1:free`, `upstage/solar-mini4:free`, `ornith/ornith-1.5-122b:free` | 17 to 22 s | no answer within 280 s |
+
+One run per cell. The paid `gpt-6.1-sol` through Hermes found more, in 30 seconds. The free tier suits reading and
+low-stakes first passes, not a review you intend to trust.
 
 ### Long tasks
 
@@ -112,8 +178,12 @@ Set `LLM_DELEGATE_STATE` to use another file.
 - **The prompt and any files the provider reads are sent to a third-party service.** Do not delegate secrets.
 - Executables are looked up only in absolute `PATH` entries other than the current directory, and on Windows only as
   `<name>.exe`, never `.cmd` or `.bat`.
-- `agy` receives the prompt as a command-line argument, so prompts over 30 000 characters are refused. Put large
-  context in files and refer to their paths. Codex receives the prompt on stdin and has no such limit.
+- `agy` and `hermes` receive the prompt as a command-line argument, so prompts over 30 000 characters are refused, and
+  on Windows so are prompts whose quoted command line passes the 32 767 UTF-16 unit limit (every `"` doubles and an
+  emoji counts twice). Put large context in files and refer to their paths. Codex receives the prompt on stdin and
+  has no such limit.
+- Hermes can read any file the logged-in user can, not only `--cwd`, since its file tools are not confined to it.
+  Its copy protects `--cwd` from being changed, not other paths from being read or written.
 - Calls are expensive. Measured on one machine, answering a one-line question about a one-line file used about 23 000
   tokens with `agy` and 30 000 to 40 000 with Codex, and a one-line edit with `--write` about 36 000 (`gpt-6.1-sol`).
   Reading two files with Codex cost 85 000 before the isolation flags were added. Tiny prompts are a poor trade.
@@ -145,9 +215,18 @@ Set `LLM_DELEGATE_STATE` to use another file.
 - Killing a timed-out provider takes its whole process tree (`taskkill /T` on Windows, a process group elsewhere).
   Verified on Windows for Codex with a long command running as its child. For `agy` no long child process could be
   provoked, so that case is untested, and the tree kill cannot reach a grandchild whose parent already exited.
-- Remaining quota is not known in advance, only after a failure.
-- `--write` is available but has had very little real use; keep it to a separate branch or worktree.
-- Only Codex and `agy` are supported. `gemini` CLI is not, because it needs its own sign-in.
+- Remaining quota is known in advance only for the ChatGPT subscription (through `hermes usage`). For `agy` (Google)
+  and `nous` it is learned from a failed call. Whether a full ChatGPT window comes back as an error the tool
+  recognises was not tested, since no exhausted account was available; the percent-based pre-check is what avoids it.
+- Killing a timed-out Hermes returned on time and left no copy behind. Hermes starts a helper process
+  (`agent.managed_worker`) from its own long-running daemon, not from the process the tool kills; it exited on its
+  own about 20 seconds later. Whether the model turn keeps running (and spending quota) in that time was not checked.
+- Hermes runs on the same ChatGPT subscription as Codex CLI, so when that quota is exhausted both are blocked, each
+  after one failed call. Using subscriptions through another program's login may be restricted by the provider's
+  terms; they were not checked.
+- `--write` is available for `codex` and `agy` but has had very little real use; keep it to a separate branch or
+  worktree.
+- Only Hermes, Codex and `agy` are supported. `gemini` CLI is not, because it needs its own sign-in.
 
 ## Tests
 
@@ -161,6 +240,8 @@ The tests replace the providers with fakes and use a temporary state file; they 
 
 Not affiliated with any of these. They solve nearby problems and are worth a look:
 
+- [NousResearch/hermes-agent](https://github.com/nousresearch/hermes-agent): the agent used here as a provider; it
+  has its own fallback providers and credential pools.
 - [pvjbuilds/delegate-router](https://github.com/pvjbuilds/delegate-router): routing table and delegation rules for
   Codex, `agy` and a subagent; no quota tracking.
 - [janekbaraniewski/openusage](https://github.com/janekbaraniewski/openusage): reads usage from local tool data,

@@ -10,6 +10,18 @@ from pathlib import Path
 
 import delegate as d
 
+REAL_HERMES_LIMITS = d.hermes_limits
+
+
+def setUpModule():
+    # No test may call the real `hermes usage`: it takes seconds and reads the real subscription.
+    d.hermes_limits = lambda provider, timeout=30: {"plan": None, "windows": []}
+
+
+def tearDownModule():
+    d.hermes_limits = REAL_HERMES_LIMITS
+
+
 CODEX_OK = "\n".join([
     '{"type":"thread.started","thread_id":"x"}',
     '{"type":"turn.started"}',
@@ -435,6 +447,320 @@ class Robustness(unittest.TestCase):
 
     def test_suffix_forbids_shell_commands(self):
         self.assertIn("cannot run shell commands", d.AGY_SUFFIX)
+
+
+class CooldownAndCmdline(unittest.TestCase):
+    def test_cooldown_reads_whole_time_words_only(self):
+        cases = {
+            "You've hit your usage limit. Try again in 3h 20m.": 3 * 3600 + 20 * 60,
+            "retry in 500 milliseconds": 60,  # sub-second: the one-minute floor, not 500 minutes
+            "retry in 5 messages": None, "quota exceeded": None, "try again in 1.5 hours": 5400,
+            "reset after 2 days": 172800, "retry in 2 minutes and 30 seconds": 150, "resets in 90s": 90,
+            "try again in 5 hrs": 18000, "retry in 2 min": 120, "retry in 45 seconds": 60,
+        }
+        for text, expected in cases.items():
+            self.assertEqual(d.parse_cooldown(text), expected, text)
+
+    def test_cmdline_counts_utf16_units(self):
+        self.assertEqual(d.cmdline_units(["a", "\U0001F600"]), 4)  # "a", space, and two units for the emoji
+
+    @unittest.skipUnless(os.name == "nt", "the command line limit is a Windows one")
+    def test_emoji_prompt_that_overflows_the_limit_is_refused(self):
+        called = []
+        real_run, real_find = d._run, d.find_exe
+        d._run, d.find_exe = lambda *a, **k: called.append(1), lambda n: "agy"
+        try:
+            res = d.run_agy("\U0001F600" * 20000, ".", False, {}, 5)  # 20 000 characters, 40 000 UTF-16 units
+        finally:
+            d._run, d.find_exe = real_run, real_find
+        self.assertFalse(res.ok)
+        self.assertEqual(called, [])
+
+
+class HermesRuns(unittest.TestCase):
+    USAGE = {"completed": True, "failed": False, "total_tokens": 14494}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.src = Path(self.tmp.name) / "project"
+        (self.src / ".git").mkdir(parents=True)
+        (self.src / ".git" / "config").write_text("secret history")
+        (self.src / "sub").mkdir()
+        (self.src / "note.txt").write_text("hello")
+        (self.src / "sub" / "a.py").write_text("print(1)")
+        self.real = (d._run, d.find_exe)
+        d.find_exe = lambda n: "hermes"
+        self.addCleanup(lambda: (setattr(d, "_run", self.real[0]), setattr(d, "find_exe", self.real[1]), self.tmp.cleanup()))
+
+    def fake(self, stdout="the answer", returncode=0, usage=USAGE, touch=None):
+        seen = {}
+
+        def run(cmd, cwd, timeout, stdin_text=None):
+            seen.update(cmd=cmd, cwd=Path(cwd), timeout=timeout,
+                        copied=sorted(str(p.relative_to(cwd)).replace(os.sep, "/") for p in Path(cwd).rglob("*")))
+            if touch:
+                (Path(cwd) / touch).write_text("changed by the agent")
+            if usage is not None:
+                Path(cmd[cmd.index("--usage-file") + 1]).write_text(json.dumps(usage), encoding="utf-8")
+            return type("R", (), {"returncode": returncode, "stdout": stdout, "stderr": "err text"})
+        d._run = run
+        return seen
+
+    def test_command_line_and_result(self):
+        seen = self.fake()
+        res = d.run_hermes("question", self.src, False, {"effort": "low"}, 77)
+        self.assertEqual((res.ok, res.text, res.tokens), (True, "the answer", 14494))
+        cmd = seen["cmd"]
+        self.assertEqual(cmd[1:3], ["-z", "question"])
+        self.assertEqual(cmd[cmd.index("--provider") + 1], "openai-codex")
+        self.assertEqual(cmd[cmd.index("-m") + 1], d.HERMES_DEFAULT_MODEL)
+        self.assertEqual(cmd[cmd.index("-t") + 1], "file")  # no terminal toolset
+        self.assertIn("--safe-mode", cmd)
+        self.assertEqual(cmd[cmd.index("--reasoning") + 1], "low")
+        self.assertEqual(seen["timeout"], 77)
+
+    def test_model_is_passed_through_and_reasoning_omitted_without_effort(self):
+        seen = self.fake()
+        d.run_hermes("q", self.src, False, {"model": "gpt-6-astra"}, 5)
+        self.assertEqual(seen["cmd"][seen["cmd"].index("-m") + 1], "gpt-6-astra")
+        self.assertNotIn("--reasoning", seen["cmd"])
+
+    def test_runs_on_a_copy_and_the_original_stays_untouched(self):
+        seen = self.fake(touch="note.txt")
+        d.run_hermes("q", self.src, False, {}, 5)
+        self.assertNotEqual(seen["cwd"], self.src)
+        self.assertEqual((self.src / "note.txt").read_text(), "hello")  # the agent changed the copy only
+        self.assertFalse(seen["cwd"].exists())  # and the copy is gone afterwards
+
+    def test_copy_skips_ignored_directories(self):
+        seen = self.fake()
+        d.run_hermes("q", self.src, False, {}, 5)
+        self.assertEqual(seen["copied"], ["note.txt", "sub", "sub/a.py"])
+
+    def test_write_is_refused_without_running_anything(self):
+        seen = self.fake()
+        res = d.run_hermes("q", self.src, True, {}, 5)
+        self.assertFalse(res.ok)
+        self.assertIn("codex for --write", res.err)
+        self.assertEqual(seen, {})
+
+    def test_too_big_a_directory_is_refused(self):
+        seen = self.fake()
+        real, d.HERMES_MAX_COPY_BYTES = d.HERMES_MAX_COPY_BYTES, 5
+        try:
+            res = d.run_hermes("q", self.src, False, {}, 5)
+        finally:
+            d.HERMES_MAX_COPY_BYTES = real
+        self.assertFalse(res.ok)
+        self.assertIn("MB", res.err)
+        self.assertEqual(seen, {})
+
+    def test_failures_are_not_reported_as_answers(self):
+        for kwargs in ({"returncode": 1}, {"stdout": "  \n"}, {"usage": {"failed": True, "completed": True}},
+                       {"usage": {"completed": False}}):
+            self.fake(**kwargs)
+            self.assertFalse(d.run_hermes("q", self.src, False, {}, 5).ok, kwargs)
+
+    def test_missing_usage_file_does_not_fail_a_good_answer(self):
+        self.fake(usage=None)
+        res = d.run_hermes("q", self.src, False, {}, 5)
+        self.assertEqual((res.ok, res.tokens), (True, 0))
+
+    def test_hermes_is_first_in_the_default_order_and_registered(self):
+        self.assertEqual(list(d.RUNNERS)[0], "hermes")
+        self.assertIn("hermes", d.RUNNERS)
+
+    def test_effort_validation_for_hermes(self):
+        self.assertIsNone(d.check_options("hermes", {"effort": "ultra"}))
+        self.assertIn("not one of", d.check_options("hermes", {"effort": "extreme"}))
+
+    def test_not_installed(self):
+        d.find_exe = lambda n: None
+        self.assertEqual(d.run_hermes("q", self.src, False, {}, 5).err, "hermes not installed")
+
+
+USAGE_JSON = json.dumps({
+    "provider": "openai-codex", "plan": "Plus", "unavailable_reason": None,
+    "windows": [{"label": "Session", "used_percent": 7.0, "resets_at": "2026-10-28T16:02:37+00:00", "detail": None},
+                {"label": "Weekly", "used_percent": 1.0, "resets_at": "2026-11-04T11:02:37+00:00", "detail": None}]})
+
+
+class HermesUsage(unittest.TestCase):
+    """`hermes usage --json` gives the usage windows of the ChatGPT subscription before any call is spent."""
+
+    def run_limits(self, stdout="", returncode=0, stderr="", exc=None):
+        real = (d._run, d.find_exe)
+        seen = {}
+
+        def run(cmd, cwd, timeout, stdin_text=None):
+            seen["cmd"] = cmd
+            if exc:
+                raise exc
+            return type("R", (), {"returncode": returncode, "stdout": stdout, "stderr": stderr})
+        d._run, d.find_exe = run, lambda n: "hermes"
+        try:
+            return REAL_HERMES_LIMITS("openai-codex"), seen
+        finally:
+            d._run, d.find_exe = real
+
+    def test_windows_are_parsed(self):
+        limits, seen = self.run_limits(USAGE_JSON)
+        self.assertEqual(seen["cmd"][1:], ["usage", "--provider", "openai-codex", "--json"])
+        self.assertEqual(limits["plan"], "Plus")
+        self.assertEqual([(w["label"], w["used_percent"]) for w in limits["windows"]], [("Session", 7.0), ("Weekly", 1.0)])
+        self.assertEqual(limits["windows"][0]["resets_at"], 1793203357.0)  # 2026-10-28T16:02:37Z
+
+    def test_unreadable_windows_are_skipped(self):
+        data = json.dumps({"windows": [{"label": "x"}, {"used_percent": "n/a", "resets_at": "bad"}, "junk",
+                                       {"label": "ok", "used_percent": 50, "resets_at": "2026-10-28T16:02:37+00:00"}]})
+        self.assertEqual([w["label"] for w in self.run_limits(data)[0]["windows"]], ["ok"])
+
+    def test_every_way_of_not_knowing_is_reported(self):
+        cases = [dict(returncode=1, stderr="no credential is configured"), dict(stdout="not json"),
+                 dict(stdout=json.dumps({"unavailable_reason": "token expired"})),
+                 dict(exc=subprocess.TimeoutExpired("hermes", 30))]
+        for kwargs in cases:
+            with self.assertRaises(d.LimitsUnavailable, msg=kwargs):
+                self.run_limits(**kwargs)
+
+    def test_hermes_not_installed(self):
+        real = d.find_exe
+        d.find_exe = lambda n: None
+        try:
+            with self.assertRaises(d.LimitsUnavailable):
+                REAL_HERMES_LIMITS("openai-codex")
+        finally:
+            d.find_exe = real
+
+    def test_limit_block_picks_the_window_that_lasts_longest(self):
+        limits = {"windows": [{"label": "Session", "used_percent": 97.0, "resets_at": 5000.0},
+                              {"label": "Weekly", "used_percent": 96.0, "resets_at": 90000.0},
+                              {"label": "Other", "used_percent": 10.0, "resets_at": 99999.0}]}
+        self.assertEqual(d.limit_block(limits, 95), (90000.0, "Weekly", 96.0))
+        self.assertEqual(d.limit_block(limits, 96)[1], "Weekly")  # the threshold itself counts
+        self.assertIsNone(d.limit_block(limits, 98))
+
+    def test_format_limits(self):
+        text = d.format_limits("chatgpt", {"plan": "Plus", "windows": [{"label": "Session", "used_percent": 7.0, "resets_at": 1793203357.0}]})
+        self.assertTrue(text.startswith("chatgpt (Plus): Session 7% used, resets "))
+        self.assertEqual(d.format_limits("anthropic", {"unavailable": "no credential"}), "anthropic: unavailable (no credential)")
+
+
+class LimitPrecheck(unittest.TestCase):
+    NOW = 1000.0
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.real_state, d.STATE = d.STATE, Path(self.tmp.name) / "state.json"
+        self.saved = dict(d.RUNNERS)
+        self.ran = []
+        for n in ("hermes", "codex", "agy"):
+            d.RUNNERS[n] = (lambda name: lambda *a: (self.ran.append(name), d.Result(True, name, 1))[1])(n)
+        self.asked = []
+
+    def tearDown(self):
+        d.STATE = self.real_state
+        d.RUNNERS.clear()
+        d.RUNNERS.update(self.saved)
+        self.tmp.cleanup()
+
+    def limits(self, pct, resets=5000.0):
+        def fn(provider):
+            self.asked.append(provider)
+            return {"plan": "Plus", "windows": [{"label": "Session", "used_percent": pct, "resets_at": resets}]}
+        return fn
+
+    def go(self, providers=("hermes", "codex", "agy"), **kw):
+        return d.delegate("q", list(providers), ".", now=lambda: self.NOW, **kw)
+
+    def test_full_window_skips_both_chatgpt_providers_without_spending_a_call(self):
+        self.assertEqual(self.go(limits_fn=self.limits(97.0)), (0, "agy"))
+        self.assertEqual(self.ran, ["agy"])
+        self.assertEqual(self.asked, ["openai-codex"])  # read once for both
+        st = d.load_state()
+        self.assertEqual((st["hermes"]["blocked_until"], st["codex"]["blocked_until"]), (5000.0, 5000.0))
+        self.assertIn("Session window 97% used", st["codex"]["block_reason"])
+
+    def test_room_left_runs_the_first_provider(self):
+        self.assertEqual(self.go(limits_fn=self.limits(40.0)), (0, "hermes"))
+        self.assertEqual(self.ran, ["hermes"])
+
+    def test_a_window_that_has_already_reset_does_not_block(self):
+        self.assertEqual(self.go(limits_fn=self.limits(99.0, resets=900.0)), (0, "hermes"))
+
+    def test_stop_at_zero_does_not_look(self):
+        self.assertEqual(self.go(limits_fn=self.limits(99.0), stop_at=0), (0, "hermes"))
+        self.assertEqual(self.asked, [])
+
+    def test_no_chatgpt_provider_no_look(self):
+        self.assertEqual(self.go(("agy",), limits_fn=self.limits(99.0)), (0, "agy"))
+        self.assertEqual(self.asked, [])
+
+    def test_unknown_limits_do_not_stop_the_call(self):
+        import contextlib
+        import io
+
+        def unknown(provider):
+            raise d.LimitsUnavailable("hermes not installed")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(self.go(limits_fn=unknown), (0, "hermes"))
+        self.assertIn("not checked: hermes not installed", err.getvalue())
+
+    def test_everything_blocked_is_exit_3(self):
+        self.assertEqual(self.go(("hermes", "codex"), limits_fn=self.limits(99.0))[0], 3)
+        self.assertEqual(self.ran, [])
+
+    def test_reset_clears_the_reason_too(self):
+        self.go(limits_fn=self.limits(97.0))
+        d.cmd_reset(argparse.Namespace(provider=None))
+        self.assertNotIn("block_reason", d.load_state()["codex"])
+        self.assertNotIn("blocked_until", d.load_state()["codex"])
+
+    def test_expired_mark_loses_its_reason(self):
+        self.go(limits_fn=self.limits(97.0, resets=1500.0))
+        d.RUNNERS["hermes"] = lambda *a: d.Result(True, "hermes", 1)
+        later = d.delegate("q", ["hermes"], ".", now=lambda: 2000.0, limits_fn=self.limits(10.0))
+        self.assertEqual(later, (0, "hermes"))
+        self.assertNotIn("block_reason", d.load_state()["hermes"])
+
+    def test_status_json_shape(self):
+        import contextlib
+        import io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            d.cmd_status(argparse.Namespace(json=True, limits=False))
+        data = json.loads(out.getvalue())
+        self.assertEqual(sorted(data), ["limits", "providers"])
+        self.assertEqual(data["limits"], {})
+        self.assertIn("nous", [r["provider"] for r in data["providers"]])
+
+
+class NousFreeTier(unittest.TestCase):
+    def test_only_free_models_are_accepted(self):
+        self.assertIsNone(d.check_options("nous", {"model": "stepfun/step-3.7-flash:free", "effort": "low"}))
+        self.assertIsNone(d.check_options("nous", {}))
+        self.assertIn("free tier only", d.check_options("nous", {"model": "vendor/paid-model"}))
+        self.assertIn("not one of", d.check_options("nous", {"effort": "extreme"}))
+
+    def test_default_model_is_a_free_one_and_the_provider_is_nous(self):
+        self.assertTrue(d.NOUS_DEFAULT_MODEL.endswith(":free"))
+        seen = {}
+        real = d.run_hermes_as
+        d.run_hermes_as = lambda provider, model, *a: seen.update(provider=provider, model=model) or d.Result(True, "x", 1)
+        try:
+            d.run_nous("q", ".", False, {}, 5)
+        finally:
+            d.run_hermes_as = real
+        self.assertEqual(seen, {"provider": "nous", "model": d.NOUS_DEFAULT_MODEL})
+
+    def test_nous_is_registered_but_not_a_default_provider(self):
+        self.assertIn("nous", d.RUNNERS)
+        for command in ("run", "check"):
+            help_text = subprocess.run([sys.executable, "-I", d.__file__, command, "-h"], capture_output=True, text=True).stdout
+            self.assertIn("hermes,agy,codex", help_text)
+            self.assertNotIn("hermes,agy,codex,nous", help_text.replace("\n", ""))
+            self.assertNotIn(",nous", help_text)
 
 
 class Check(unittest.TestCase):
