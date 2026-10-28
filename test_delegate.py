@@ -477,6 +477,9 @@ class CooldownAndCmdline(unittest.TestCase):
         self.assertEqual(called, [])
 
 
+ALLOW = {"allow_unsandboxed": True}
+
+
 class HermesRuns(unittest.TestCase):
     USAGE = {"completed": True, "failed": False, "total_tokens": 14494}
 
@@ -508,7 +511,7 @@ class HermesRuns(unittest.TestCase):
 
     def test_command_line_and_result(self):
         seen = self.fake()
-        res = d.run_hermes("question", self.src, False, {"effort": "low"}, 77)
+        res = d.run_hermes("question", self.src, False, {**ALLOW, "effort": "low"}, 77)
         self.assertEqual((res.ok, res.text, res.tokens), (True, "the answer", 14494))
         cmd = seen["cmd"]
         self.assertEqual(cmd[1:3], ["-z", "question"])
@@ -521,25 +524,25 @@ class HermesRuns(unittest.TestCase):
 
     def test_model_is_passed_through_and_reasoning_omitted_without_effort(self):
         seen = self.fake()
-        d.run_hermes("q", self.src, False, {"model": "gpt-6-astra"}, 5)
+        d.run_hermes("q", self.src, False, {**ALLOW, "model": "gpt-6-astra"}, 5)
         self.assertEqual(seen["cmd"][seen["cmd"].index("-m") + 1], "gpt-6-astra")
         self.assertNotIn("--reasoning", seen["cmd"])
 
     def test_runs_on_a_copy_and_the_original_stays_untouched(self):
         seen = self.fake(touch="note.txt")
-        d.run_hermes("q", self.src, False, {}, 5)
+        d.run_hermes("q", self.src, False, ALLOW, 5)
         self.assertNotEqual(seen["cwd"], self.src)
         self.assertEqual((self.src / "note.txt").read_text(), "hello")  # the agent changed the copy only
         self.assertFalse(seen["cwd"].exists())  # and the copy is gone afterwards
 
     def test_copy_skips_ignored_directories(self):
         seen = self.fake()
-        d.run_hermes("q", self.src, False, {}, 5)
+        d.run_hermes("q", self.src, False, ALLOW, 5)
         self.assertEqual(seen["copied"], ["note.txt", "sub", "sub/a.py"])
 
     def test_write_is_refused_without_running_anything(self):
         seen = self.fake()
-        res = d.run_hermes("q", self.src, True, {}, 5)
+        res = d.run_hermes("q", self.src, True, ALLOW, 5)
         self.assertFalse(res.ok)
         self.assertIn("codex for --write", res.err)
         self.assertEqual(seen, {})
@@ -548,7 +551,7 @@ class HermesRuns(unittest.TestCase):
         seen = self.fake()
         real, d.HERMES_MAX_COPY_BYTES = d.HERMES_MAX_COPY_BYTES, 5
         try:
-            res = d.run_hermes("q", self.src, False, {}, 5)
+            res = d.run_hermes("q", self.src, False, ALLOW, 5)
         finally:
             d.HERMES_MAX_COPY_BYTES = real
         self.assertFalse(res.ok)
@@ -559,15 +562,14 @@ class HermesRuns(unittest.TestCase):
         for kwargs in ({"returncode": 1}, {"stdout": "  \n"}, {"usage": {"failed": True, "completed": True}},
                        {"usage": {"completed": False}}):
             self.fake(**kwargs)
-            self.assertFalse(d.run_hermes("q", self.src, False, {}, 5).ok, kwargs)
+            self.assertFalse(d.run_hermes("q", self.src, False, ALLOW, 5).ok, kwargs)
 
     def test_missing_usage_file_does_not_fail_a_good_answer(self):
         self.fake(usage=None)
-        res = d.run_hermes("q", self.src, False, {}, 5)
+        res = d.run_hermes("q", self.src, False, ALLOW, 5)
         self.assertEqual((res.ok, res.tokens), (True, 0))
 
-    def test_hermes_is_first_in_the_default_order_and_registered(self):
-        self.assertEqual(list(d.RUNNERS)[0], "hermes")
+    def test_hermes_is_registered(self):
         self.assertIn("hermes", d.RUNNERS)
 
     def test_effort_validation_for_hermes(self):
@@ -576,7 +578,7 @@ class HermesRuns(unittest.TestCase):
 
     def test_not_installed(self):
         d.find_exe = lambda n: None
-        self.assertEqual(d.run_hermes("q", self.src, False, {}, 5).err, "hermes not installed")
+        self.assertEqual(d.run_hermes("q", self.src, False, ALLOW, 5).err, "hermes not installed")
 
 
 USAGE_JSON = json.dumps({
@@ -736,6 +738,78 @@ class LimitPrecheck(unittest.TestCase):
         self.assertIn("nous", [r["provider"] for r in data["providers"]])
 
 
+class UnsandboxedGate(unittest.TestCase):
+    """hermes and nous have no sandbox, so they only run when the caller says the input is trusted."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.src = Path(self.tmp.name) / "project"
+        self.src.mkdir()
+        (self.src / "a.txt").write_text("x")
+        self.called = []
+        self.real = (d._run, d.find_exe)
+        d._run = lambda *a, **k: self.called.append(1)
+        d.find_exe = lambda n: "hermes"
+        self.addCleanup(lambda: (setattr(d, "_run", self.real[0]), setattr(d, "find_exe", self.real[1]), self.tmp.cleanup()))
+
+    def test_refused_without_the_flag_and_nothing_is_run_or_copied(self):
+        for runner in (d.run_hermes, d.run_nous):
+            res = runner("q", self.src, False, {}, 5)
+            self.assertFalse(res.ok)
+            self.assertIn("--allow-unsandboxed", res.err)
+            self.assertIn("not sandboxed", res.err)
+        self.assertEqual(self.called, [])
+
+    def test_flag_reaches_every_provider_option(self):
+        self.assertEqual(d.build_options(["agy", "hermes", "nous"], None, None, True),
+                         {n: {"allow_unsandboxed": True} for n in ("agy", "hermes", "nous")})
+        self.assertEqual(d.build_options(["hermes"], None, None), {"hermes": {}})
+
+    def test_cli_flag_is_parsed_for_run_and_check(self):
+        for command in ("run", "check"):
+            text = subprocess.run([sys.executable, "-I", d.__file__, command, "-h"], capture_output=True, text=True).stdout
+            self.assertIn("--allow-unsandboxed", text)
+
+    def test_unsandboxed_providers_fall_through_to_a_sandboxed_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            real_state, d.STATE = d.STATE, Path(tmp) / "state.json"
+            saved = dict(d.RUNNERS)
+            d.RUNNERS["agy"] = lambda *a: d.Result(True, "from agy", 1)
+            try:
+                self.assertEqual(d.delegate("q", ["hermes", "nous", "agy"], self.src, opts={"hermes": {}, "nous": {}}),
+                                 (0, "from agy"))
+            finally:
+                d.STATE = real_state
+                d.RUNNERS.clear()
+                d.RUNNERS.update(saved)
+
+    def test_links_and_junctions_are_not_copied(self):
+        outside = Path(self.tmp.name) / "outside"
+        outside.mkdir()
+        (outside / "secret.txt").write_text("outside")
+        (self.src / "real").mkdir()
+        (self.src / "real" / "b.txt").write_text("b")
+        made = []
+        if os.name == "nt":
+            r = subprocess.run(["cmd", "/c", "mklink", "/J", str(self.src / "junction"), str(outside)], capture_output=True)
+            made.append("junction") if r.returncode == 0 else None
+        else:
+            os.symlink(outside, self.src / "junction")
+            made.append("junction")
+        try:
+            os.symlink(outside / "secret.txt", self.src / "filelink")
+            made.append("filelink")
+        except OSError:  # creating file symlinks needs a privilege on Windows
+            pass
+        if not made:
+            self.skipTest("could not create any link on this system")
+        dst = Path(self.tmp.name) / "copy"
+        d.copy_workdir(self.src, dst)
+        names = sorted(str(p.relative_to(dst)).replace(os.sep, "/") for p in dst.rglob("*"))
+        self.assertEqual(names, ["a.txt", "real", "real/b.txt"])
+        self.assertTrue((outside / "secret.txt").exists())  # and nothing was touched through the link
+
+
 class NousFreeTier(unittest.TestCase):
     def test_only_free_models_are_accepted(self):
         self.assertIsNone(d.check_options("nous", {"model": "stepfun/step-3.7-flash:free", "effort": "low"}))
@@ -758,8 +832,8 @@ class NousFreeTier(unittest.TestCase):
         self.assertIn("nous", d.RUNNERS)
         for command in ("run", "check"):
             help_text = subprocess.run([sys.executable, "-I", d.__file__, command, "-h"], capture_output=True, text=True).stdout
-            self.assertIn("hermes,agy,codex", help_text)
-            self.assertNotIn("hermes,agy,codex,nous", help_text.replace("\n", ""))
+            self.assertIn("default: agy,codex", help_text)  # neither unsandboxed provider is tried unless named
+            self.assertNotIn("default: hermes", help_text)
             self.assertNotIn(",nous", help_text)
 
 

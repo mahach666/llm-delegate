@@ -8,7 +8,7 @@ already paid for, instead of spending the host's own tokens. One file, no depend
 
 ```
 $ python delegate.py run "Read src/ and summarise the module layout in 15 lines"
-[delegate] hermes: ok, 10305 tokens
+[delegate] agy: ok, 23187 tokens
 <the answer, and nothing else, on stdout>
 ```
 
@@ -16,7 +16,7 @@ $ python delegate.py run "Read src/ and summarise the module layout in 15 lines"
 
 - **Runs one prompt** through `hermes`, `agy` or `codex` in non-interactive mode and prints only the answer to
   stdout. Diagnostics go to stderr, so the output can be piped or captured as is.
-- **Falls back.** Providers are tried in the order given (default `hermes,agy,codex`). If one reports a usage limit,
+- **Falls back.** Providers are tried in the order given (default `agy,codex`). If one reports a usage limit,
   it is marked as exhausted until the reset time (taken from the error text when present, otherwise one hour) and is
   skipped on later calls. Any other failure moves on to the next provider without a mark.
 - **Chooses model and effort** per provider (`--model`, `--effort`) and rejects combinations Codex is known not to
@@ -26,9 +26,9 @@ $ python delegate.py run "Read src/ and summarise the module layout in 15 lines"
 - **Reads the ChatGPT subscription's usage windows** (`hermes usage`) and skips `hermes` and `codex`, without
   spending a call, while a window is at or above 95 percent. `status` shows them next to the ledger.
 - **Can use the Nous Portal free tier** through Hermes (`nous`), opt-in because of its data-use terms.
-- **Is read-only by default.** Codex runs with `-s read-only`, `agy` with `--mode plan`, and Hermes, which has no
-  read-only mode, only on a throwaway copy of `--cwd` (see Hermes below). `--write` allows edits in `--cwd` for
-  `codex` and `agy`; `hermes` refuses it.
+- **Is read-only by default** for `codex` (`-s read-only`) and `agy` (`--mode plan`); `--write` allows edits in
+  `--cwd`. **`hermes` and `nous` are not sandboxed** and refuse to run unless you pass `--allow-unsandboxed` (see
+  Hermes below).
 
 ## Requirements
 
@@ -41,10 +41,10 @@ $ python delegate.py run "Read src/ and summarise the module layout in 15 lines"
 ## Usage
 
 ```
-delegate.py run [--providers hermes,agy,codex] [--model [P=]M] [--effort [P=]E] [--cwd DIR] [--write]
-                [--timeout SECONDS] [--cooldown SECONDS] [--stop-at PERCENT] PROMPT|-
+delegate.py run [--providers agy,codex] [--model [P=]M] [--effort [P=]E] [--cwd DIR] [--write]
+                [--allow-unsandboxed] [--timeout SECONDS] [--cooldown SECONDS] [--stop-at PERCENT] PROMPT|-
 delegate.py models [--json]
-delegate.py check [--providers hermes,agy,codex] [--model [P=]M] [--effort [P=]E]
+delegate.py check [--providers agy,codex] [--model [P=]M] [--effort [P=]E] [--allow-unsandboxed]
 delegate.py status [--json] [--no-limits]
 delegate.py reset [PROVIDER]
 ```
@@ -70,16 +70,28 @@ one from that file. Pass `--model`. Those flags also drop `[windows] sandbox`, w
 run any command and answers that it can't read files. The tool therefore reads that one value from your `config.toml`
 and passes it back with `-c windows.sandbox=...`.
 
-### Hermes
+### Hermes (not sandboxed)
 
-[Hermes Agent](https://github.com/nousresearch/hermes-agent) is a full agent, not a plain CLI. Its one-shot mode
-(`hermes -z`) bypasses approvals and it has no read-only mode: the smallest toolset that reads files, `file`, also
-writes them. The tool therefore runs it with `-t file` (no terminal) and `--safe-mode` (no config, memory, plugins or
-MCP servers), and only inside a throwaway copy of `--cwd` that is deleted afterwards. Consequences:
+[Hermes Agent](https://github.com/nousresearch/hermes-agent) is a full agent, not a plain CLI, and it cannot be made
+read-only. Its one-shot mode (`hermes -z`) bypasses approvals, and the smallest toolset that reads files, `file`, also
+writes them: single tools cannot be picked (`-t read_file,search_files` is rejected). **Tested: with `-t file` it wrote
+a file in the working directory, at `../name` and at an absolute path outside it.** Hermes documents a guard,
+`HERMES_WRITE_SAFE_ROOT`, for exactly this; setting it for the call changed nothing, because the file tools run in a
+worker started by Hermes's own long-running daemon, which does not receive this process's environment. Setting it
+for the daemon would limit every use of Hermes on the machine, so the tool does not.
 
-- `--write` is refused for Hermes (use `codex` or `agy`). File names in its answer refer to the copy.
-- The copy skips `.git`, `node_modules`, `__pycache__`, `.venv` and `venv`, and is refused above 200 MB. Point `--cwd`
-  at a smaller directory if a project does not fit.
+What follows from that:
+
+- **`hermes` and `nous` refuse to run unless `--allow-unsandboxed` is given**, and they are not in the default
+  order. Pass the flag only for input you wrote or trust. A prompt injected through the input (a file, a log, a web
+  page) could make the agent write or overwrite files anywhere the user can, which can mean code that runs later.
+  Use `agy` or `codex` for anything untrusted.
+- The tool still runs it with `-t file` (no terminal), `--safe-mode` (no config, memory, plugins or MCP servers) and
+  in a throwaway copy of `--cwd` that is deleted afterwards. That keeps an ordinary run from changing the original
+  through a relative path, nothing more. Symbolic links and junctions are not copied, `.git`, `node_modules`,
+  `__pycache__`, `.venv` and `venv` are skipped, and a directory over 200 MB is refused.
+- `--write` is refused for Hermes. File names in its answer refer to the copy.
+- Its file tools can also read any file the user can, and what they read goes to the model provider.
 - `--safe-mode` ignores Hermes's own config, so a model is always passed: `gpt-6.1-sol` unless you give `--model`.
   The provider is fixed to `openai-codex` (the ChatGPT login), the same subscription Codex CLI uses.
 - Hermes does not read the prompt from stdin (`-z -` is taken as the text `-`), so the prompt is an argument.
@@ -87,12 +99,13 @@ MCP servers), and only inside a throwaway copy of `--cwd` that is deleted afterw
 Measured on one machine with `gpt-6.1-sol`: reading a one-line file took 7 400 tokens and 15 seconds (Codex CLI:
 30 000 to 38 000), and a review of a 437-line file 14 500 tokens and 30 seconds (Codex CLI: 154 000 tokens, 40
 seconds), with findings at least as good, all confirmed by hand. One task, one run per setting; Hermes was given only
-file tools while Codex CLI could run commands to reproduce what it found, which explains part of the gap.
+file tools while Codex CLI could run commands to reproduce what it found, which explains part of the gap. That
+saving is real, and it is why the flag exists instead of the provider being removed.
 
 ### Check
 
 ```
-python delegate.py check [--providers hermes,agy,codex] [--model [P=]M] [--effort [P=]E]
+python delegate.py check [--providers agy,codex] [--model [P=]M] [--effort [P=]E] [--allow-unsandboxed]
 ```
 
 Asks each provider to read a file whose contents it can only learn by reading it, and prints `PASS` or `FAIL`.
@@ -128,8 +141,9 @@ learned only from a failed call.
 ### Free tier (`nous`)
 
 Hermes can use the free models of the [Nous Portal](https://portal.nousresearch.com/) (ids ending in `:free`). The
-provider `nous` runs them the same way as `hermes`: file tools only, `--safe-mode`, a throwaway copy of `--cwd`. It is
-never in the default order and refuses a model that does not end in `:free`, so it cannot spend paid credits.
+provider `nous` runs them the same way as `hermes`, with the same lack of a sandbox (see above): it needs
+`--allow-unsandboxed`, is never in the default order and refuses a model that does not end in `:free`, so it cannot
+spend paid credits.
 
 **Data use: according to a third-party summary of the vendor's terms, inputs to the free tier may be used for training
 or product improvement unless Privacy Mode is on.** Do not send private, proprietary or sensitive code or documents
@@ -182,8 +196,9 @@ Set `LLM_DELEGATE_STATE` to use another file.
   on Windows so are prompts whose quoted command line passes the 32 767 UTF-16 unit limit (every `"` doubles and an
   emoji counts twice). Put large context in files and refer to their paths. Codex receives the prompt on stdin and
   has no such limit.
-- Hermes can read any file the logged-in user can, not only `--cwd`, since its file tools are not confined to it.
-  Its copy protects `--cwd` from being changed, not other paths from being read or written.
+- Hermes's file tools are not confined to `--cwd`: they can read and write any file the logged-in user can. The copy
+  protects `--cwd` from ordinary relative-path writes, not other paths, and `HERMES_WRITE_SAFE_ROOT` did not help
+  (see Hermes). That is why `hermes` and `nous` need `--allow-unsandboxed`.
 - Calls are expensive. Measured on one machine, answering a one-line question about a one-line file used about 23 000
   tokens with `agy` and 30 000 to 40 000 with Codex, and a one-line edit with `--write` about 36 000 (`gpt-6.1-sol`).
   Reading two files with Codex cost 85 000 before the isolation flags were added. Tiny prompts are a poor trade.

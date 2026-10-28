@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Hand a prompt to Hermes, Antigravity (agy) or Codex and fall back when a subscription runs out.
 
-    delegate.py run [--providers hermes,agy,codex] [--cwd DIR] [--write] [--model [P=]M] [--effort [P=]E] PROMPT|-
+    delegate.py run [--providers agy,codex] [--cwd DIR] [--write] [--model [P=]M] [--effort [P=]E] PROMPT|-
     delegate.py models [--json]
-    delegate.py check [--providers hermes,agy,codex] [--model [P=]M] [--effort [P=]E]
+    delegate.py check [--providers agy,codex] [--model [P=]M] [--effort [P=]E]
     delegate.py status [--json]
     delegate.py reset [PROVIDER]
 
@@ -14,9 +14,12 @@ servers, `notify` command and rules do not apply and Codex's own default model i
 one setting passed back is `[windows] sandbox` (without it Codex cannot run commands on Windows).
 `check` runs a real read-the-file test on each provider; run it after changing flags, models or any of the CLIs.
 
-Hermes (`hermes -z`, ChatGPT login via `hermes auth add openai-codex --type oauth`) has no read-only mode and its
-one-shot runs bypass approvals, so it is only run with file tools and --safe-mode, inside a throwaway copy of --cwd
-that is deleted afterwards. It cannot be used with --write, and file names in its answer refer to that copy.
+Hermes (`hermes`, ChatGPT login via `hermes auth add openai-codex --type oauth`) and Nous free tier (`nous`) are NOT
+sandboxed: their file tools can write anywhere the user can (tested), so both refuse to run without
+--allow-unsandboxed, which is for input you wrote or trust, and neither is in the default order. They run with file
+tools only and --safe-mode, inside a throwaway copy of --cwd (links not copied) that is deleted afterwards; that guards
+the original against ordinary relative paths only. They cannot be used with --write, and file names in their answers
+refer to that copy.
 
 `--timeout SECONDS` (default 600; 0 = no limit) is per provider; when it expires the provider's whole process tree is
 killed and the next provider is tried. For tasks that run longer than your shell tool allows in the foreground,
@@ -251,25 +254,47 @@ def run_agy(prompt, cwd, write, o, timeout):
     return Result(False, err=f"exit {p.returncode}\n{p.stdout}\n{p.stderr}")
 
 
+UNSANDBOXED = (
+    "hermes and nous are not sandboxed: their file tools can write anywhere the user can, and neither the working copy "
+    "nor HERMES_WRITE_SAFE_ROOT stopped that in testing (the tools run in a worker started by Hermes's own daemon, which "
+    "does not get this process's environment). A prompt injected through the input could write or overwrite files. "
+    "Pass --allow-unsandboxed only for input you wrote or trust; use agy or codex otherwise")
+
+
+def is_link(path):
+    """A symbolic link or, on Windows, a junction. Writing through one lands outside the copy."""
+    return os.path.islink(path) or getattr(os.path, "isjunction", lambda p: False)(path)
+
+
 def copy_workdir(src, dst):
-    """Copy src to dst. Hermes cannot be made read-only, so it works on a throwaway copy. ValueError if src is too big."""
+    """Copy src to dst, leaving out links, ignored directories and anything over the size cap (ValueError).
+
+    The copy keeps Hermes from changing the original through ordinary paths. It is not a sandbox: see UNSANDBOXED.
+    """
+    skip_names = shutil.ignore_patterns(*HERMES_COPY_IGNORE)
+
+    def ignore(directory, names):
+        return set(skip_names(directory, names)) | {n for n in names if is_link(os.path.join(directory, n))}
+
     total = 0
     for root, dirs, files in os.walk(src):
-        dirs[:] = [d for d in dirs if d not in HERMES_COPY_IGNORE]
+        dirs[:] = [d for d in dirs if d not in HERMES_COPY_IGNORE and not is_link(os.path.join(root, d))]
         for name in files:
             try:
                 total += os.lstat(os.path.join(root, name)).st_size
-            except FileNotFoundError:  # a broken link or a file that vanished while walking
+            except FileNotFoundError:  # a file that vanished while walking
                 continue
             if total > HERMES_MAX_COPY_BYTES:
                 raise ValueError(f"{src} is over {HERMES_MAX_COPY_BYTES // 2**20} MB; point --cwd at a smaller directory")
-    shutil.copytree(src, dst, ignore=shutil.ignore_patterns(*HERMES_COPY_IGNORE), symlinks=True)
+    shutil.copytree(src, dst, ignore=ignore)
 
 
 def run_hermes_as(provider, default_model, prompt, cwd, write, o, timeout):
     exe = find_exe("hermes")
     if not exe:
         return Result(False, err="hermes not installed")
+    if not o.get("allow_unsandboxed"):
+        return Result(False, err=UNSANDBOXED)
     if write:
         return Result(False, err="hermes has no read-only or sandbox mode, so it only works on a throwaway copy; "
                                  "use codex for --write")
@@ -397,9 +422,10 @@ def per_provider(values, names, flag):
     return out
 
 
-def build_options(names, models, efforts):
+def build_options(names, models, efforts, allow_unsandboxed=False):
     ms, es = per_provider(models, names, "--model"), per_provider(efforts, names, "--effort")
-    opts = {n: {k: v for k, v in (("model", ms.get(n)), ("effort", es.get(n))) if v} for n in names}
+    opts = {n: {k: v for k, v in (("model", ms.get(n)), ("effort", es.get(n)),
+                                  ("allow_unsandboxed", allow_unsandboxed or None)) if v} for n in names}
     for n, o in opts.items():
         err = check_options(n, o)
         if err:
@@ -663,7 +689,7 @@ def providers_and_options(args):
         print(f"[delegate] unknown provider(s): {unknown or 'none given'}; known: {', '.join(RUNNERS)}", file=sys.stderr)
         return names, None
     try:
-        return names, build_options(names, args.model, args.effort)
+        return names, build_options(names, args.model, args.effort, args.allow_unsandboxed)
     except ValueError as e:
         print(f"[delegate] {e}", file=sys.stderr)
         return names, None
@@ -681,6 +707,10 @@ def cmd_run(args):
     return code
 
 
+UNSANDBOX_HELP = ("let hermes and nous run although they are not sandboxed (their file tools can write anywhere the "
+                  "user can); only for input you wrote or trust")
+
+
 def seconds(value):
     n = int(value)
     if n < 0:
@@ -695,11 +725,12 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run")
     r.add_argument("prompt", help="prompt text, or - to read stdin")
-    r.add_argument("--providers", default="hermes,agy,codex", help="try in this order (default: hermes,agy,codex)")
+    r.add_argument("--providers", default="agy,codex", help="try in this order (default: agy,codex)")
     r.add_argument("--cwd", default=".")
     r.add_argument("--write", action="store_true", help="allow edits in cwd (default is read-only)")
     r.add_argument("--model", action="append", metavar="[PROVIDER=]MODEL")
     r.add_argument("--effort", action="append", metavar="[PROVIDER=]LEVEL", help="reasoning effort, see `models`")
+    r.add_argument("--allow-unsandboxed", action="store_true", help=UNSANDBOX_HELP)
     r.add_argument("--timeout", type=seconds, default=600, metavar="SECONDS",
                    help="give up on a provider after this long and try the next; 0 means no limit (default 600)")
     r.add_argument("--cooldown", type=int, default=DEFAULT_COOLDOWN, help="seconds to block a provider when no reset time is given")
@@ -711,10 +742,11 @@ def main(argv=None):
     m.add_argument("--json", action="store_true")
     m.set_defaults(fn=cmd_models)
     c = sub.add_parser("check", help="make each provider read a test file; spends tokens on every provider")
-    c.add_argument("--providers", default="hermes,agy,codex", help="providers to test (default: hermes,agy,codex)")
+    c.add_argument("--providers", default="agy,codex", help="providers to test (default: agy,codex)")
     c.add_argument("--model", action="append", metavar="[PROVIDER=]MODEL")
     c.add_argument("--effort", action="append", metavar="[PROVIDER=]LEVEL")
     c.add_argument("--timeout", type=seconds, default=300, metavar="SECONDS", help="0 means no limit (default 300)")
+    c.add_argument("--allow-unsandboxed", action="store_true", help=UNSANDBOX_HELP)
     c.set_defaults(fn=cmd_check)
     s = sub.add_parser("status", help="calls, tokens, out-of-quota marks and subscription usage windows")
     s.add_argument("--json", action="store_true")
